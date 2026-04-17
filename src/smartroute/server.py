@@ -21,6 +21,7 @@ from pydantic import BaseModel, ConfigDict
 from sse_starlette.sse import EventSourceResponse
 
 from smartroute.config import settings
+from smartroute import db as _db
 from smartroute.providers import ProviderError
 from smartroute.router import Router
 
@@ -115,8 +116,11 @@ class _SmartRouteMeta(BaseModel):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    if settings.database_url:
+        await _db.init_pool(settings.database_url)
     app.state.router = Router()
     yield
+    await _db.close_pool()
 
 
 app = FastAPI(title="SmartRoute", version="0.1.0", lifespan=lifespan)
@@ -158,6 +162,7 @@ async def health() -> dict:
 async def chat_completions(body: ChatCompletionRequest) -> JSONResponse:
     router: Router = app.state.router
     content, decision = await router.route_async(body.messages)
+    await _db.insert_decision(decision)
 
     meta = _SmartRouteMeta(
         difficulty_tier=decision.difficulty_tier,

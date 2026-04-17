@@ -1,4 +1,20 @@
 services:
+  postgres:
+    image: pgvector/pgvector:pg17
+    environment:
+      POSTGRES_USER: smartroute
+      POSTGRES_PASSWORD: smartroute
+      POSTGRES_DB: smartroute
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U smartroute"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
   smartroute:
     build: .
     ports:
@@ -8,3 +24,10 @@ services:
     environment:
       SERVER_HOST: "0.0.0.0"
       SERVER_PORT: "8000"
+      DATABASE_URL: "postgresql://smartroute:smartroute@postgres:5432/smartroute"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  pgdata:

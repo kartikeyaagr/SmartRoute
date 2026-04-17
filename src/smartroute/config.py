@@ -38,6 +38,9 @@ class Settings(BaseSettings):
     cache_ttl_seconds: float = 3600.0  # 1 hour default
     cache_max_size: int = 1000  # max entries for in-memory LRU cache
 
+    # Database — leave empty to run without Postgres (JSONL logging only)
+    database_url: str = ""
+
     # Server
     server_host: str = "0.0.0.0"
     server_port: int = 8000

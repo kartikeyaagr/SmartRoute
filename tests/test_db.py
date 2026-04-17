@@ -1,0 +1,74 @@
+"""
+Unit tests for db.py — no real Postgres required.
+Tests that insert_decision is a no-op when pool is None, and that
+the server lifespan skips DB init when DATABASE_URL is empty.
+"""
+
+import pytest
+from unittest.mock import AsyncMock, MagicMock, patch
+
+from smartroute.router import RoutingDecision
+import smartroute.db as db_module
+
+
+def _decision():
+    return RoutingDecision(
+        request_id="test-001",
+        prompt_hash="abc",
+        difficulty_tier="EASY",
+        difficulty_score=0.8,
+        final_model="groq/llama-3.1-8b-instant",
+        classifier_backend="keyword",
+    )
+
+
+@pytest.mark.asyncio
+async def test_insert_noop_when_no_pool():
+    """insert_decision should silently do nothing when pool is None."""
+    original = db_module._pool
+    db_module._pool = None
+    try:
+        await db_module.insert_decision(_decision())  # must not raise
+    finally:
+        db_module._pool = original
+
+
+@pytest.mark.asyncio
+async def test_insert_logs_error_on_db_failure():
+    """insert_decision logs the error but never raises — DB failures don't kill the API."""
+    mock_conn = AsyncMock()
+    mock_conn.execute.side_effect = Exception("connection refused")
+    mock_pool = MagicMock()
+    mock_pool.acquire.return_value.__aenter__ = AsyncMock(return_value=mock_conn)
+    mock_pool.acquire.return_value.__aexit__ = AsyncMock(return_value=False)
+
+    original = db_module._pool
+    db_module._pool = mock_pool
+    try:
+        await db_module.insert_decision(_decision())  # must not raise
+    finally:
+        db_module._pool = original
+
+
+@pytest.mark.asyncio
+async def test_close_pool_noop_when_none():
+    """close_pool should be safe to call even when pool was never initialised."""
+    original = db_module._pool
+    db_module._pool = None
+    try:
+        await db_module.close_pool()  # must not raise
+    finally:
+        db_module._pool = original
+
+
+@pytest.mark.asyncio
+async def test_server_skips_db_init_when_no_url(monkeypatch):
+    """Lifespan should not call init_pool when DATABASE_URL is empty."""
+    from smartroute import server as srv
+    monkeypatch.setattr(srv.settings, "database_url", "")
+
+    with patch.object(db_module, "init_pool", new=AsyncMock()) as mock_init:
+        with patch.object(db_module, "close_pool", new=AsyncMock()):
+            async with srv.lifespan(srv.app):
+                pass
+        mock_init.assert_not_called()
