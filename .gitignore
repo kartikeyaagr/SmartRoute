@@ -1,0 +1,29 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+.DS_Store
+
+# Virtual environments
+.venv
+
+# Secrets
+.env
+
+# Private planning dirs (never commit)
+docs/
+tasks/
+get_models.py
+TODOS.md
+models.json
+
+# Benchmark results (can be large, but keep directory)
+bench/results/*.jsonl
+bench/results/*.json
+bench/results/*.md
+
+# Model cache
+.cache/
