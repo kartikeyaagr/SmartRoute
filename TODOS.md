@@ -3,7 +3,7 @@
 > Single source of truth for project state and roadmap.
 > Update after every feature add or completed task.
 
-**Current status:** v0.2 pgvector cache complete — 81 tests passing. Starting v0.3 observability.
+**Current status:** v0.3 observability complete — 88 tests passing. Starting v0.4 classifier improvements.
 
 ---
 
@@ -77,14 +77,14 @@ Success criteria (if <25% cost reduction, reassess routing thresholds before v0.
 
 ---
 
-## v0.3 — Observability
+## v0.3 — Observability (COMPLETE ✅)
 
 > **Why this milestone bundle:** Observability is a prerequisite for enterprise sales and catching production regressions. All four items share the same instrumentation layer.
 
-- [ ] Prometheus metrics: latency histograms, cost counters, escalation rate, cache hit rate
-- [ ] Grafana dashboard
-- [ ] Structured JSON logging with trace IDs
-- [ ] OpenTelemetry traces across provider calls
+- [x] Prometheus metrics: `requests_total`, `request_latency_seconds`, `cost_usd_total`, `escalations_total`, `cache_hits_total` — exposed at `GET /metrics`
+- [x] Structured JSON logging via `python-json-logger` (configured at server startup via `LOG_LEVEL`)
+- [x] OpenTelemetry traces — span per `route_async` call with tier/model/cost/latency attributes; ships to OTLP endpoint when `OTEL_EXPORTER_OTLP_ENDPOINT` is set
+- [ ] Grafana dashboard (needs running Grafana + Prometheus — deferred to infra setup)
 
 ---
 

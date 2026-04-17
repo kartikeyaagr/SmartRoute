@@ -3,6 +3,7 @@ SmartRoute FastAPI server — OpenAI-compatible chat completions endpoint.
 
 Endpoints:
     GET  /health                  — liveness check
+    GET  /metrics                 — Prometheus metrics
     POST /v1/chat/completions     — OpenAI-compatible, stream supported
 
 SmartRoute routing metadata is returned in the X-SmartRoute-Meta response header
@@ -15,13 +16,15 @@ from contextlib import asynccontextmanager
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request, Security
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from pydantic import BaseModel, ConfigDict
 from sse_starlette.sse import EventSourceResponse
 
-from smartroute.config import settings
 from smartroute import db as _db
+from smartroute import observability as _obs
+from smartroute.config import settings
 from smartroute.providers import ProviderError
 from smartroute.router import Router
 
@@ -33,7 +36,7 @@ def _require_auth(
 ) -> None:
     """Validate Bearer token if SMARTROUTE_SERVER_API_KEY is configured."""
     if not settings.server_api_key:
-        return  # auth disabled
+        return
     if credentials is None or not secrets.compare_digest(
         credentials.credentials, settings.server_api_key
     ):
@@ -116,6 +119,8 @@ class _SmartRouteMeta(BaseModel):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    _obs.configure_logging(settings.log_level)
+    _obs.configure_tracing()
     if settings.database_url:
         await _db.init_pool(settings.database_url)
     app.state.router = Router()
@@ -158,11 +163,27 @@ async def health() -> dict:
     return {"status": "ok"}
 
 
+@app.get("/metrics")
+async def metrics() -> Response:
+    return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
+
 @app.post("/v1/chat/completions", dependencies=[Security(_require_auth)])
 async def chat_completions(body: ChatCompletionRequest) -> JSONResponse:
-    router: Router = app.state.router
-    content, decision = await router.route_async(body.messages)
+    tracer = _obs.get_tracer()
+    with tracer.start_as_current_span("smartroute.route") as span:
+        router: Router = app.state.router
+        content, decision = await router.route_async(body.messages)
+
+        span.set_attribute("smartroute.tier", decision.difficulty_tier)
+        span.set_attribute("smartroute.model", decision.final_model)
+        span.set_attribute("smartroute.escalated", decision.escalated)
+        span.set_attribute("smartroute.latency_ms", decision.latency_ms)
+        span.set_attribute("smartroute.cost_usd", decision.estimated_cost_usd)
+        span.set_attribute("smartroute.cache_hit", decision.cache_hit)
+
     await _db.insert_decision(decision)
+    _obs.record_decision(decision)
 
     meta = _SmartRouteMeta(
         difficulty_tier=decision.difficulty_tier,

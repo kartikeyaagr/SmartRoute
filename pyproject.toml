@@ -30,6 +30,11 @@ server = [
     "sse-starlette>=3.3.4",
     "asyncpg>=0.31.0",
     "pgvector>=0.4.2",
+    "prometheus-client>=0.21",
+    "python-json-logger>=2.0",
+    "opentelemetry-sdk>=1.25",
+    "opentelemetry-instrumentation-fastapi>=0.46b0",
+    "opentelemetry-exporter-otlp-proto-grpc>=1.25",
 ]
 
 # CLI entry point for the API server (requires [server] extra)

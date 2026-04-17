@@ -44,6 +44,7 @@ class Settings(BaseSettings):
     # Server
     server_host: str = "0.0.0.0"
     server_port: int = 8000
+    log_level: str = "INFO"
     # When set, all /v1/* requests must carry `Authorization: Bearer <key>`.
     # Leave empty to run unauthenticated (local dev only).
     server_api_key: str = ""
