@@ -1,0 +1,60 @@
+[project]
+name = "smartroute"
+version = "0.1.0"
+description = "LLM inference router with difficulty-based routing and FrugalGPT-style cascade"
+# 3.13 was the tested env at project start; 3.11+ is likely compatible but unverified.
+# Relax to >=3.11 once CI validates multi-version support.
+requires-python = ">=3.13"
+dependencies = [
+    "litellm>=1.83.9",
+    "pydantic-settings>=2.0",
+    "python-dotenv>=1.0",
+]
+
+[project.optional-dependencies]
+# uv sync --extra ml — DeBERTa-NLI classifier (~400MB model download)
+ml = [
+    "transformers>=4.40",
+    "torch>=2.2",
+]
+# uv sync --extra bench — MMLU benchmark harness
+bench = [
+    "datasets>=2.19",
+]
+# uv sync --extra server — FastAPI API server (server.py)
+# Server deps are optional: the library works without them.
+server = [
+    "fastapi>=0.136.0",
+    "uvicorn[standard]>=0.44.0",
+    "sse-starlette>=3.3.4",
+]
+
+# CLI entry point for the API server (requires [server] extra)
+[project.scripts]
+smartroute-server = "smartroute.server:main"
+
+[dependency-groups]
+dev = [
+    "httpx>=0.28.1",
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+]
+
+# Hatchling: lightweight build backend with no config overhead.
+# Chosen over setuptools (too verbose) and poetry (requires poetry.lock, not uv-native).
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/smartroute"]
+
+[tool.pytest.ini_options]
+# asyncio_mode=auto: all async test functions run as coroutines without @pytest.mark.asyncio.
+asyncio_mode = "auto"
+testpaths = ["tests"]
+# pythonpath=["src"]: makes `import smartroute` work without an editable install.
+pythonpath = ["src"]
+markers = [
+    "integration: requires real API keys (skipped by default)",
+]
