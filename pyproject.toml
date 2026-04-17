@@ -16,6 +16,7 @@ dependencies = [
 ml = [
     "transformers>=4.40",
     "torch>=2.2",
+    "sentence-transformers>=3.0",
 ]
 # uv sync --extra bench — MMLU benchmark harness
 bench = [
@@ -28,6 +29,7 @@ server = [
     "uvicorn[standard]>=0.44.0",
     "sse-starlette>=3.3.4",
     "asyncpg>=0.31.0",
+    "pgvector>=0.4.2",
 ]
 
 # CLI entry point for the API server (requires [server] extra)

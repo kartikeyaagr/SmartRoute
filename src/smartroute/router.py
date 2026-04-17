@@ -62,12 +62,13 @@ def _hash_prompt(messages: list[dict]) -> str:
     return hashlib.sha256(payload.encode()).hexdigest()
 
 
-def _cache_kwargs() -> dict:
-    """Extract cache-relevant settings for InMemoryLRUCache constructor."""
-    return {
-        "max_size": settings.cache_max_size,
-        "ttl_seconds": settings.cache_ttl_seconds,
-    }
+def _cache_kwargs(backend: str) -> dict:
+    base = {"ttl_seconds": settings.cache_ttl_seconds}
+    if backend == "memory":
+        base["max_size"] = settings.cache_max_size
+    if backend == "pgvector":
+        base["similarity_threshold"] = settings.cache_similarity_threshold
+    return base
 
 
 async def _append_decision(path: Path, decision: RoutingDecision) -> None:
@@ -99,7 +100,7 @@ class Router:
         self._verifier = verifier or CascadeVerifier()
         self._cache = cache if cache is not None else get_cache(
             settings.cache_backend,
-            **(_cache_kwargs() if settings.cache_backend == "memory" else {}),
+            **_cache_kwargs(settings.cache_backend),
         )
         self._log_path = log_path
         self._verifier_enabled = verifier_enabled

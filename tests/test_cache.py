@@ -7,7 +7,7 @@ All tests use mocked providers — no real API calls.
 import pytest
 from unittest.mock import AsyncMock, MagicMock
 
-from smartroute.cache import CacheHit, InMemoryLRUCache, NoOpCache, PromptCache, get_cache
+from smartroute.cache import CacheHit, InMemoryLRUCache, NoOpCache, PgvectorCache, PromptCache, get_cache
 from smartroute.classifier import DifficultyTier
 from smartroute.providers import ModelResponse, ProviderError
 from smartroute.router import Router
@@ -99,15 +99,127 @@ def test_get_cache_memory_returns_lru():
     assert isinstance(cache, InMemoryLRUCache)
 
 
+def test_get_cache_pgvector_returns_pgvector():
+    cache = get_cache("pgvector")
+    assert isinstance(cache, PgvectorCache)
+
+
 def test_get_cache_unknown_raises():
     with pytest.raises(ValueError, match="Unknown cache backend"):
         get_cache("redis")
 
 
 def test_prompt_cache_protocol():
-    # Both implementations satisfy the Protocol
     assert isinstance(NoOpCache(), PromptCache)
     assert isinstance(InMemoryLRUCache(), PromptCache)
+    assert isinstance(PgvectorCache(), PromptCache)
+
+
+# ---------------------------------------------------------------------------
+# PgvectorCache — no-pool behaviour (no real Postgres required)
+# ---------------------------------------------------------------------------
+
+async def test_pgvector_get_returns_none_when_no_pool():
+    """PgvectorCache.get is a miss when DB pool is uninitialised."""
+    import smartroute.db as db_module
+    original = db_module._pool
+    db_module._pool = None
+    try:
+        cache = PgvectorCache()
+        result = await cache.get("any prompt")
+        assert result is None
+    finally:
+        db_module._pool = original
+
+
+async def test_pgvector_put_is_noop_when_no_pool():
+    """PgvectorCache.put does nothing when DB pool is uninitialised."""
+    import smartroute.db as db_module
+    original = db_module._pool
+    db_module._pool = None
+    try:
+        cache = PgvectorCache()
+        await cache.put("any prompt", "any response")  # must not raise
+    finally:
+        db_module._pool = original
+
+
+async def test_pgvector_get_returns_none_on_db_error(monkeypatch):
+    """PgvectorCache.get returns None (miss) on any DB exception — never raises."""
+    import smartroute.db as db_module
+
+    mock_conn = AsyncMock()
+    mock_conn.execute = AsyncMock()
+    mock_conn.fetchrow = AsyncMock(side_effect=Exception("connection lost"))
+    mock_pool = MagicMock()
+    mock_pool.acquire.return_value.__aenter__ = AsyncMock(return_value=mock_conn)
+    mock_pool.acquire.return_value.__aexit__ = AsyncMock(return_value=False)
+
+    original = db_module._pool
+    db_module._pool = mock_pool
+
+    # Mock out the encoder so we don't download a model
+    cache = PgvectorCache()
+    cache._encoder = MagicMock()
+    cache._encoder.encode.return_value = MagicMock(tolist=lambda: [0.1] * 384)
+
+    try:
+        result = await cache.get("test prompt")
+        assert result is None
+    finally:
+        db_module._pool = original
+
+
+async def test_pgvector_below_threshold_is_miss(monkeypatch):
+    """A similarity score below threshold must not be returned as a hit."""
+    import smartroute.db as db_module
+
+    mock_conn = AsyncMock()
+    mock_conn.execute = AsyncMock()
+    mock_conn.fetchrow = AsyncMock(return_value={"response": "cached", "similarity": 0.80})
+    mock_pool = MagicMock()
+    mock_pool.acquire.return_value.__aenter__ = AsyncMock(return_value=mock_conn)
+    mock_pool.acquire.return_value.__aexit__ = AsyncMock(return_value=False)
+
+    original = db_module._pool
+    db_module._pool = mock_pool
+
+    cache = PgvectorCache(similarity_threshold=0.95)
+    cache._encoder = MagicMock()
+    cache._encoder.encode.return_value = MagicMock(tolist=lambda: [0.1] * 384)
+
+    try:
+        result = await cache.get("test prompt")
+        assert result is None  # 0.80 < 0.95 threshold → miss
+    finally:
+        db_module._pool = original
+
+
+async def test_pgvector_above_threshold_is_hit(monkeypatch):
+    """A similarity score at/above threshold returns a CacheHit."""
+    import smartroute.db as db_module
+
+    mock_conn = AsyncMock()
+    mock_conn.execute = AsyncMock()
+    mock_conn.fetchrow = AsyncMock(return_value={"response": "cached answer", "similarity": 0.97})
+    mock_pool = MagicMock()
+    mock_pool.acquire.return_value.__aenter__ = AsyncMock(return_value=mock_conn)
+    mock_pool.acquire.return_value.__aexit__ = AsyncMock(return_value=False)
+
+    original = db_module._pool
+    db_module._pool = mock_pool
+
+    cache = PgvectorCache(similarity_threshold=0.95)
+    cache._encoder = MagicMock()
+    cache._encoder.encode.return_value = MagicMock(tolist=lambda: [0.1] * 384)
+
+    try:
+        hit = await cache.get("test prompt")
+        assert hit is not None
+        assert hit.response == "cached answer"
+        assert hit.similarity == pytest.approx(0.97)
+    finally:
+        db_module._pool = original
 
 
 # ---------------------------------------------------------------------------

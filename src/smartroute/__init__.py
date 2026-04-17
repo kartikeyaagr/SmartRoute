@@ -1,4 +1,4 @@
-from smartroute.cache import CacheHit, InMemoryLRUCache, NoOpCache, PromptCache, get_cache
+from smartroute.cache import CacheHit, InMemoryLRUCache, NoOpCache, PgvectorCache, PromptCache, get_cache
 from smartroute.classifier import DifficultyClassifier, DifficultyTier, get_classifier
 from smartroute.config import settings
 from smartroute.providers import ModelResponse, ProviderError, call_model
@@ -20,5 +20,6 @@ __all__ = [
     "CacheHit",
     "NoOpCache",
     "InMemoryLRUCache",
+    "PgvectorCache",
     "get_cache",
 ]

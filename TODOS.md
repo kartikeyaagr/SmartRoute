@@ -3,7 +3,7 @@
 > Single source of truth for project state and roadmap.
 > Update after every feature add or completed task.
 
-**Current status:** v0.1 complete — 75 tests passing. Starting v0.2 pgvector cache.
+**Current status:** v0.2 pgvector cache complete — 81 tests passing. Starting v0.3 observability.
 
 ---
 
@@ -56,7 +56,7 @@ Success criteria (if <25% cost reduction, reassess routing thresholds before v0.
 
 ---
 
-## v0.2 — Semantic Prompt Cache
+## v0.2 — Semantic Prompt Cache (COMPLETE ✅)
 
 > **Why this milestone bundle:** Cache architecture (pluggable interface, per-tenant scoping, TTL) must be right before traffic exists — painful to retrofit. Stage 1 already done (in-memory exact-match seam). Stage 2 adds pgvector semantic similarity.
 
@@ -67,12 +67,13 @@ Success criteria (if <25% cost reduction, reassess routing thresholds before v0.
 - [x] `Router.route_async` checks cache before classifier; writes on success
 - [x] `CACHE_BACKEND` / `CACHE_TTL_SECONDS` / `CACHE_MAX_SIZE` settings
 
-### Stage 2 — pgvector semantic cache
+### Stage 2 — pgvector semantic cache (COMPLETE ✅)
 
-- [ ] `PgvectorCache` — embed prompt → cosine similarity lookup
-- [ ] Per-tenant cache namespace (cross-tenant hits = privacy breach — non-negotiable)
-- [ ] Cache TTL sweep + invalidation
-- [ ] Cache metrics: hit rate, cost saved, latency delta
+- [x] `PgvectorCache` — sentence-transformers (all-MiniLM-L6-v2, local) → cosine similarity lookup
+- [x] Per-tenant cache namespace via `tenant_id` (cross-tenant hits prevented)
+- [x] TTL enforced via `expires_at` column + `ON CONFLICT DO NOTHING` upsert
+- [x] Falls back to miss on any DB error — never blocks API response
+- [ ] Cache metrics: hit rate, cost saved, latency delta (v0.3 observability)
 
 ---
 
