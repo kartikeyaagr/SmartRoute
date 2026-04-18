@@ -24,7 +24,7 @@ _MANUAL_PRICING: dict[str, tuple[float, float]] = {
     "groq/qwen/qwen3-32b":           (0.29 / 1_000_000, 0.59 / 1_000_000),
     # Together AI
     "together_ai/meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo":  (0.18 / 1_000_000, 0.18 / 1_000_000),
-    "together_ai/meta-llama/Meta-Llama-3.3-70B-Instruct-Turbo": (0.88 / 1_000_000, 0.88 / 1_000_000),
+    "together_ai/meta-llama/Llama-3.3-70B-Instruct-Turbo": (0.88 / 1_000_000, 0.88 / 1_000_000),
     "together_ai/Qwen/Qwen2.5-72B-Instruct-Turbo":              (1.20 / 1_000_000, 1.20 / 1_000_000),
 }
 

@@ -4,7 +4,7 @@ CascadeVerifier: anti-self-grading cross-provider response quality check.
 Scores cheap model responses 1-5. Escalates to frontier if score < threshold.
 
 Anti-self-grading rule: verifier must differ from both cheap AND frontier models.
-  cheap=together_ai/meta-llama/Meta-Llama-3.1-8B → verifier=Qwen2.5-72B (different arch)
+  cheap=together_ai/.../Meta-Llama-3.1-8B → verifier=Qwen2.5-72B (different arch)
   cheap=anything-else                             → verifier=Qwen2.5-72B (default)
 
 Frontier is Meta-Llama-3.3-70B — verifier is Qwen (Alibaba architecture), intentionally
