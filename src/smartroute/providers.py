@@ -18,9 +18,14 @@ logger = logging.getLogger(__name__)
 # Manual per-token pricing fallback for models LiteLLM doesn't price.
 # Rates are (input_per_token_usd, output_per_token_usd).
 _MANUAL_PRICING: dict[str, tuple[float, float]] = {
+    # Groq
     "groq/llama-3.1-8b-instant":    (0.05 / 1_000_000, 0.08 / 1_000_000),
     "groq/llama-3.3-70b-versatile": (0.59 / 1_000_000, 0.79 / 1_000_000),
     "groq/qwen/qwen3-32b":           (0.29 / 1_000_000, 0.59 / 1_000_000),
+    # Together AI
+    "together_ai/meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo":  (0.18 / 1_000_000, 0.18 / 1_000_000),
+    "together_ai/meta-llama/Meta-Llama-3.3-70B-Instruct-Turbo": (0.88 / 1_000_000, 0.88 / 1_000_000),
+    "together_ai/Qwen/Qwen2.5-72B-Instruct-Turbo":              (1.20 / 1_000_000, 1.20 / 1_000_000),
 }
 
 

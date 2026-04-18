@@ -27,8 +27,8 @@ from smartroute.verifier import CascadeVerifier
 
 logger = logging.getLogger(__name__)
 
-_CHEAP_SEQUENCE = ["groq/llama-3.1-8b-instant"]
-_FRONTIER_SEQUENCE = ["groq/llama-3.3-70b-versatile"]
+_CHEAP_SEQUENCE = ["together_ai/meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo"]
+_FRONTIER_SEQUENCE = ["together_ai/meta-llama/Meta-Llama-3.3-70B-Instruct-Turbo"]
 
 _log_lock = asyncio.Lock()
 
