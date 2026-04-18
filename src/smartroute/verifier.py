@@ -4,11 +4,11 @@ CascadeVerifier: anti-self-grading cross-provider response quality check.
 Scores cheap model responses 1-5. Escalates to frontier if score < threshold.
 
 Anti-self-grading rule: verifier must differ from both cheap AND frontier models.
-  cheap=groq/llama-3.1-8b-instant → verifier=groq/qwen/qwen3-32b  (different arch)
-  cheap=anything-else             → verifier=groq/qwen/qwen3-32b   (default)
+  cheap=together_ai/meta-llama/Meta-Llama-3.1-8B → verifier=Qwen2.5-72B (different arch)
+  cheap=anything-else                             → verifier=Qwen2.5-72B (default)
 
-Frontier is groq/llama-3.3-70b-versatile — verifier is intentionally kept off that
-model so the escalation path uses a genuinely different model.
+Frontier is Meta-Llama-3.3-70B — verifier is Qwen (Alibaba architecture), intentionally
+kept off the Llama family so the quality check is genuinely cross-architecture.
 """
 
 import logging
@@ -43,7 +43,7 @@ _INT_RE = re.compile(r"\b([1-5])\b")
 # Frontier = groq/llama-3.3-70b-versatile, so verifier must NOT be that model.
 # Qwen3-32B is a different architecture (Alibaba) — good cross-family verifier.
 _VERIFIER_MODEL_FOR: dict[str, str] = {}  # no overrides needed; default covers all cases
-_DEFAULT_VERIFIER = "groq/qwen/qwen3-32b"
+_DEFAULT_VERIFIER = "together_ai/Qwen/Qwen2.5-72B-Instruct-Turbo"
 
 
 def _pick_verifier(cheap_model: str) -> str:

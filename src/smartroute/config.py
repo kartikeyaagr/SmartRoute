@@ -15,6 +15,7 @@ class Settings(BaseSettings):
     anthropic_api_key: str = ""
     gemini_api_key: str = ""
     groq_api_key: str = ""
+    togetherai_api_key: str = ""
 
     # Classifier
     classifier: str = "keyword"  # "keyword" or "deberta"
@@ -62,3 +63,5 @@ if settings.gemini_api_key:
     os.environ.setdefault("GEMINI_API_KEY", settings.gemini_api_key)
 if settings.groq_api_key:
     os.environ.setdefault("GROQ_API_KEY", settings.groq_api_key)
+if settings.togetherai_api_key:
+    os.environ.setdefault("TOGETHERAI_API_KEY", settings.togetherai_api_key)
