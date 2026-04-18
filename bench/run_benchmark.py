@@ -5,7 +5,7 @@ Modes:
   1 / routing-only    — classifier decides tier, no verifier, cheap or frontier directly
   2 / cascade-only    — all prompts treated as MEDIUM (cheap → verifier → maybe frontier)
   3 / full            — classifier + cascade (full SmartRoute)
-  4 / always-frontier — all prompts → groq/llama-3.3-70b-versatile (baseline)
+  4 / always-frontier — all prompts → frontier model (baseline, see router._FRONTIER_SEQUENCE)
 
 Usage:
   uv run bench/run_benchmark.py --mode routing-only --dry-run
@@ -32,8 +32,8 @@ sys.path.insert(0, str(_REPO_ROOT / "src"))
 
 from smartroute.classifier import DifficultyClassifier, DifficultyTier, get_classifier
 from smartroute.config import settings
-from smartroute.providers import ProviderError, call_model
-from smartroute.router import Router, RoutingDecision
+from smartroute.providers import ProviderError, call_model, _MANUAL_PRICING
+from smartroute.router import Router, RoutingDecision, _CHEAP_SEQUENCE, _FRONTIER_SEQUENCE
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -44,15 +44,16 @@ VALID_ANSWERS = {"A", "B", "C", "D"}
 DATA_PATH = Path(__file__).parent / "data" / "mmlu_500.jsonl"
 RESULTS_DIR = Path(__file__).parent / "results"
 
+# Derived from router config — single source of truth
+_CHEAP_MODEL = _CHEAP_SEQUENCE[0]
+_FRONTIER_MODEL = _FRONTIER_SEQUENCE[0]
+
+# Per-1K-token pricing for cost estimation (input, output)
 _COST_PER_1K: dict[str, tuple[float, float]] = {
-    "claude-haiku-4-5":              (0.00025, 0.00125),
-    "gemini/gemini-2.5-flash":       (0.00015, 0.0006),
-    "ollama/llama3.1":               (0.0, 0.0),
-    "gpt-4o":                        (0.0025, 0.01),
-    "claude-opus-4-6":               (0.015, 0.075),
-    "groq/llama-3.1-8b-instant":     (0.00005, 0.00008),
-    "groq/llama-3.3-70b-versatile":  (0.00059, 0.00079),
+    model: (in_rate * 1000, out_rate * 1000)
+    for model, (in_rate, out_rate) in _MANUAL_PRICING.items()
 }
+
 _AVG_MMLU_INPUT_TOKENS = 200
 _AVG_OUTPUT_TOKENS = 3
 
@@ -154,53 +155,56 @@ def extract_answer(response: str) -> tuple[str, bool]:
 # Preflight
 # ---------------------------------------------------------------------------
 
-def _preflight_cascade() -> list[str]:
-    issues = []
-    if not settings.anthropic_api_key:
-        issues.append("ANTHROPIC_API_KEY missing (claude-haiku-4-5)")
-    if not settings.gemini_api_key:
-        issues.append("GEMINI_API_KEY missing (gemini/gemini-2.5-flash + verifier)")
-    if not settings.openai_api_key:
-        issues.append("GROQ_API_KEY missing (groq/llama-3.3-70b-versatile frontier)")
-    return issues
+def _has_key_for(model: str) -> bool:
+    """Check that the relevant provider API key is set for the given model string."""
+    if model.startswith("groq/"):
+        return bool(settings.groq_api_key)
+    if model.startswith("together_ai/"):
+        return bool(settings.togetherai_api_key)
+    if model.startswith("gpt") or "openai" in model:
+        return bool(settings.openai_api_key)
+    if "anthropic" in model or "claude" in model:
+        return bool(settings.anthropic_api_key)
+    if "gemini" in model:
+        return bool(settings.gemini_api_key)
+    return True  # unknown provider — let it fail at runtime
 
 
 def preflight(mode: str) -> list[str]:
-    if mode == "always-frontier":
-        return [] if settings.groq_api_key else ["GROQ_API_KEY missing (groq/llama-3.3-70b-versatile)"]
-    return _preflight_cascade()
+    issues = []
+    if not _has_key_for(_FRONTIER_MODEL):
+        issues.append(f"API key missing for frontier model: {_FRONTIER_MODEL}")
+    if mode != "always-frontier" and not _has_key_for(_CHEAP_MODEL):
+        issues.append(f"API key missing for cheap model: {_CHEAP_MODEL}")
+    return issues
 
 
 # ---------------------------------------------------------------------------
 # Cost estimation (dry-run)
 # ---------------------------------------------------------------------------
 
-def _cheap_cost_per_prompt() -> float:
-    in_rate, out_rate = _COST_PER_1K["groq/llama-3.1-8b-instant"]
-    return (_AVG_MMLU_INPUT_TOKENS * in_rate + _AVG_OUTPUT_TOKENS * out_rate) / 1000
-
-
-def _frontier_cost_per_prompt() -> float:
-    in_rate, out_rate = _COST_PER_1K["groq/llama-3.3-70b-versatile"]
+def _cost_per_prompt(model: str) -> float:
+    if model not in _COST_PER_1K:
+        return 0.0
+    in_rate, out_rate = _COST_PER_1K[model]
     return (_AVG_MMLU_INPUT_TOKENS * in_rate + _AVG_OUTPUT_TOKENS * out_rate) / 1000
 
 
 def estimate_cost(mode: str, rows: list[dict]) -> float:
     n = len(rows)
     if mode == "always-frontier":
-        return n * _frontier_cost_per_prompt()
+        return n * _cost_per_prompt(_FRONTIER_MODEL)
     if mode == "routing-only":
         tier_counts = Counter(r["difficulty_tier"] for r in rows)
         cheap_n = tier_counts.get("EASY", 0) + tier_counts.get("MEDIUM", 0)
         hard_n = tier_counts.get("HARD", 0)
-        return cheap_n * _cheap_cost_per_prompt() + hard_n * _frontier_cost_per_prompt()
+        return cheap_n * _cost_per_prompt(_CHEAP_MODEL) + hard_n * _cost_per_prompt(_FRONTIER_MODEL)
     if mode in ("cascade-only", "full"):
-        # cheap call + verifier call (≈ cheap) + ~30% escalation to frontier
         escalation_rate = 0.30
         per_prompt = (
-            _cheap_cost_per_prompt()       # cheap model
-            + _cheap_cost_per_prompt()     # verifier call (similar size)
-            + escalation_rate * _frontier_cost_per_prompt()
+            _cost_per_prompt(_CHEAP_MODEL)
+            + _cost_per_prompt(_CHEAP_MODEL)      # verifier ≈ cheap model size
+            + escalation_rate * _cost_per_prompt(_FRONTIER_MODEL)
         )
         return n * per_prompt
     return 0.0
@@ -266,19 +270,18 @@ async def run_prompt_mode4(row: dict, sem: asyncio.Semaphore, results_path: Path
         {"role": "system", "content": MMLU_SYSTEM_PROMPT},
         {"role": "user", "content": row["prompt"]},
     ]
-    _FRONTIER = "groq/llama-3.3-70b-versatile"
     result = BenchResult(
         source_id=row["source_id"],
         subject=row["subject"],
         difficulty_tier=row["difficulty_tier"],
         correct_answer=row["correct_answer"],
-        final_model=_FRONTIER,
-        cascade_path=[_FRONTIER],
+        final_model=_FRONTIER_MODEL,
+        cascade_path=[_FRONTIER_MODEL],
     )
     async with sem:
         t0 = time.perf_counter()
         try:
-            resp = await call_model(_FRONTIER, messages)
+            resp = await call_model(_FRONTIER_MODEL, messages)
             result.latency_ms = (time.perf_counter() - t0) * 1000
             result.model_response = resp.content
             result.estimated_cost_usd = resp.estimated_cost_usd
