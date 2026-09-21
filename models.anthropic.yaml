@@ -1,0 +1,40 @@
+# Anthropic tier ladder.
+#
+# Use with:  CATALOG_PATH=models.anthropic.yaml uv run ...
+#
+# Proof that the catalog is the only thing that needs to change to move providers:
+# this file swaps all three tiers from Together AI to Anthropic with no source edits.
+#
+# Note there is deliberately no `judge` role here. Every Claude model is the same
+# model family, and catalog.py refuses to load a judge that shares a family with the
+# tier it grades — with Anthropic-only access, cross-family verification is impossible,
+# so the cascade verifier stays off (which it is by default anyway).
+
+version: 1
+
+models:
+  - alias: cheap
+    id: claude-haiku-4-5
+    role: cheap
+    env_key: ANTHROPIC_API_KEY
+
+  - alias: middle
+    id: claude-sonnet-5
+    role: middle
+    env_key: ANTHROPIC_API_KEY
+
+  - alias: frontier
+    id: claude-opus-5
+    role: frontier
+    env_key: ANTHROPIC_API_KEY
+
+routing:
+  tiers: [cheap, middle, frontier]
+  default_tier: middle
+
+decision:
+  # Anthropic's ladder is much more spread out than the Together one
+  # ($1 -> $2 -> $5 per M input, vs $0.05 -> $0.15 -> $0.60), so the saving from a
+  # correct lookup divert is larger and layer 1 can afford to fire more often at the
+  # same lambda.
+  lambda_wrong_answer_usd: 0.001
