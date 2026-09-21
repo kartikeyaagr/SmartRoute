@@ -21,9 +21,9 @@ TODOS.md
 models.json
 
 # Benchmark results (can be large, but keep directory)
-bench/results/*.jsonl
-bench/results/*.json
-bench/results/*.md
+harness/results/*.jsonl
+harness/results/*.json
+harness/results/*.md
 
 # Model cache
 .cache/

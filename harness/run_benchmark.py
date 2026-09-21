@@ -8,10 +8,10 @@ Modes:
   4 / always-frontier — all prompts → frontier model (baseline, see models.yaml)
 
 Usage:
-  uv run bench/run_benchmark.py --mode routing-only --dry-run
-  uv run bench/run_benchmark.py --mode always-frontier --prompts 50
-  uv run bench/run_benchmark.py --mode full
-  uv run bench/run_benchmark.py --all-modes --prompts 50
+  uv run harness/run_benchmark.py --mode routing-only --dry-run
+  uv run harness/run_benchmark.py --mode always-frontier --prompts 50
+  uv run harness/run_benchmark.py --mode full
+  uv run harness/run_benchmark.py --all-modes --prompts 50
 """
 
 import argparse
@@ -496,7 +496,7 @@ async def main() -> None:
 
     if not DATA_PATH.exists():
         print(f"ERROR: MMLU data not found at {DATA_PATH}")
-        print("Run: uv run bench/data/mmlu_difficulty.py")
+        print("Run: uv run harness/data/mmlu_difficulty.py")
         sys.exit(1)
 
     rows = load_mmlu(DATA_PATH, n=args.prompts)

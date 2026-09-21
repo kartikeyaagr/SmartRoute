@@ -2112,6 +2112,8 @@ bench = [
     { name = "datasets" },
 ]
 ml = [
+    { name = "joblib" },
+    { name = "scikit-learn" },
     { name = "sentence-transformers" },
     { name = "torch" },
     { name = "transformers" },
@@ -2141,6 +2143,7 @@ requires-dist = [
     { name = "asyncpg", marker = "extra == 'server'", specifier = ">=0.31.0" },
     { name = "datasets", marker = "extra == 'bench'", specifier = ">=2.19" },
     { name = "fastapi", marker = "extra == 'server'", specifier = ">=0.136.0" },
+    { name = "joblib", marker = "extra == 'ml'", specifier = ">=1.4" },
     { name = "litellm", specifier = ">=1.83.9" },
     { name = "opentelemetry-exporter-otlp-proto-grpc", marker = "extra == 'server'", specifier = ">=1.25" },
     { name = "opentelemetry-instrumentation-fastapi", marker = "extra == 'server'", specifier = ">=0.46b0" },
@@ -2151,6 +2154,7 @@ requires-dist = [
     { name = "python-dotenv", specifier = ">=1.0" },
     { name = "python-json-logger", marker = "extra == 'server'", specifier = ">=2.0" },
     { name = "pyyaml", specifier = ">=6.0" },
+    { name = "scikit-learn", marker = "extra == 'ml'", specifier = ">=1.5" },
     { name = "sentence-transformers", marker = "extra == 'ml'", specifier = ">=3.0" },
     { name = "sse-starlette", marker = "extra == 'server'", specifier = ">=3.3.4" },
     { name = "torch", marker = "extra == 'ml'", specifier = ">=2.2" },
