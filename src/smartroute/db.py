@@ -42,17 +42,37 @@ CREATE TABLE IF NOT EXISTS routing_decisions (
     cache_hit       BOOLEAN     NOT NULL DEFAULT FALSE,
     cache_similarity DOUBLE PRECISION,
     error           TEXT,
+    route_path      TEXT        NOT NULL DEFAULT '',
+    gate_reason     TEXT        NOT NULL DEFAULT '',
+    p_lookup        DOUBLE PRECISION,
+    p_decompose     DOUBLE PRECISION,
+    projected_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
+    subtask_count   INTEGER     NOT NULL DEFAULT 0,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
 )
 """
+
+# CREATE TABLE IF NOT EXISTS does nothing to a table that already exists, so a
+# deployment that predates the two-layer decision fields would keep its old schema and
+# every INSERT would fail — silently, because insert_decision swallows exceptions.
+# These run on every startup and are no-ops once applied.
+_MIGRATIONS = [
+    "ALTER TABLE routing_decisions ADD COLUMN IF NOT EXISTS route_path TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE routing_decisions ADD COLUMN IF NOT EXISTS gate_reason TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE routing_decisions ADD COLUMN IF NOT EXISTS p_lookup DOUBLE PRECISION",
+    "ALTER TABLE routing_decisions ADD COLUMN IF NOT EXISTS p_decompose DOUBLE PRECISION",
+    "ALTER TABLE routing_decisions ADD COLUMN IF NOT EXISTS projected_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0",
+    "ALTER TABLE routing_decisions ADD COLUMN IF NOT EXISTS subtask_count INTEGER NOT NULL DEFAULT 0",
+]
 
 _INSERT = """
 INSERT INTO routing_decisions (
     request_id, prompt_hash, difficulty_tier, difficulty_score,
     cascade_path, verifier_score, escalated, final_model,
     input_tokens, output_tokens, estimated_cost_usd, latency_ms,
-    classifier_backend, cache_hit, cache_similarity, error
-) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
+    classifier_backend, cache_hit, cache_similarity, error,
+    route_path, gate_reason, p_lookup, p_decompose, projected_cost_usd, subtask_count
+) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)
 """
 
 
@@ -69,6 +89,8 @@ async def init_pool(database_url: str) -> None:
         except Exception as exc:
             logger.warning("pgvector extension not available: %s", exc)
         await conn.execute(_CREATE_TABLE)
+        for statement in _MIGRATIONS:
+            await conn.execute(statement)
     logger.info("Postgres pool initialised")
 
 
@@ -104,7 +126,14 @@ async def insert_decision(decision) -> None:
                 d["cache_hit"],
                 d["cache_similarity"],
                 d["error"],
+                d.get("route_path", ""),
+                d.get("gate_reason", ""),
+                d.get("p_lookup"),
+                d.get("p_decompose"),
+                d.get("projected_cost_usd", 0.0),
+                d.get("subtask_count", 0),
             )
     except Exception as exc:
-        # Never let a DB write failure kill the API response
+        # Never let a DB write failure kill the API response. Logged at ERROR rather
+        # than swallowed silently: a schema drift shows up here or nowhere.
         logger.error("Failed to insert routing_decision %s: %s", d["request_id"], exc)
