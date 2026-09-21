@@ -245,13 +245,19 @@ class DecisionLayer:
         triage: Triage | None = None,
         lookup_threshold: float | None = None,
         decompose_threshold: float = 0.75,
-        lambda_wrong_usd: float = 0.001,
+        lambda_wrong_usd: float | None = None,
         cost_model: CostModel | None = None,
     ) -> None:
         self._catalog = catalog or get_catalog()
         self._triage = triage or EmbeddingTriage()
         self._decompose_threshold = decompose_threshold
-        self._lambda = lambda_wrong_usd
+        # Defaults to the catalog's knob so the economics live in one file alongside
+        # the prices they are compared against.
+        self._lambda = (
+            lambda_wrong_usd
+            if lambda_wrong_usd is not None
+            else getattr(self._catalog, "lambda_wrong_answer_usd", 0.001)
+        )
         self._costs = cost_model or CostModel()
         self._lookup_threshold = (
             lookup_threshold

@@ -128,11 +128,18 @@ class Catalog:
     picking a model for a sub-task, and the order the escalation ladder walks.
     """
 
-    def __init__(self, models: list[ModelSpec], tier_order: list[str], default_tier: str) -> None:
+    def __init__(
+        self,
+        models: list[ModelSpec],
+        tier_order: list[str],
+        default_tier: str,
+        lambda_wrong_answer_usd: float = 0.001,
+    ) -> None:
         self._by_alias = {m.alias: m for m in models}
         self._by_id = {m.id: m for m in models}
         self._tier_order = tier_order
         self._default_tier = default_tier
+        self.lambda_wrong_answer_usd = lambda_wrong_answer_usd
 
     # -- lookup ------------------------------------------------------------
 
@@ -311,7 +318,12 @@ def load_catalog(path: str | Path | None = None) -> Catalog:
 
     _check_judge_is_cross_family(path, by_alias)
 
-    catalog = Catalog(models, tier_order, default_tier)
+    decision = raw.get("decision") or {}
+    lambda_wrong = float(decision.get("lambda_wrong_answer_usd", 0.001))
+    if lambda_wrong < 0:
+        raise CatalogError(f"{path}: decision.lambda_wrong_answer_usd must be >= 0")
+
+    catalog = Catalog(models, tier_order, default_tier, lambda_wrong)
     logger.debug("catalog loaded: %s (fingerprint %s)", tier_order, catalog.fingerprint())
     return catalog
 
