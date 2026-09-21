@@ -14,7 +14,7 @@ version: 1
 
 models:
   - alias: cheap
-    id: claude-haiku-4-5
+    id: claude-haiku-4-5-20251001
     role: cheap
     env_key: ANTHROPIC_API_KEY
 
@@ -22,11 +22,14 @@ models:
     id: claude-sonnet-5
     role: middle
     env_key: ANTHROPIC_API_KEY
+    # Measured: returns 400 `temperature is deprecated for this model`.
+    unsupported_params: [temperature]
 
   - alias: frontier
     id: claude-opus-5
     role: frontier
     env_key: ANTHROPIC_API_KEY
+    unsupported_params: [temperature]
 
 routing:
   tiers: [cheap, middle, frontier]

@@ -157,6 +157,7 @@ class Router:
         self,
         messages: list[dict],
         request_id: str | None = None,
+        **params,
     ) -> tuple[str, RoutingDecision]:
         """
         Route messages to the appropriate model.
@@ -192,7 +193,7 @@ class Router:
             return hit.response, decision
 
         if self._dispatch_mode == "decision":
-            return await self._route_by_decision(messages, prompt_text, rid, t0)
+            return await self._route_by_decision(messages, prompt_text, rid, t0, params)
 
         tier, score = self._classifier.classify(messages)
 
@@ -229,6 +230,7 @@ class Router:
         prompt_text: str,
         rid: str,
         t0: float,
+        params: dict | None = None,
     ) -> tuple[str, RoutingDecision]:
         """
         Two-layer dispatch: triage -> gate -> (cheap | middle | frontier | decompose).
@@ -266,7 +268,7 @@ class Router:
                 decision.gate_reason = f"{route.reason} | layer2: {result.reason}"
                 decision.escalated = result.route == "bailout-frontier"
             else:
-                content = await self._call_tier(route.path, messages, decision)
+                content = await self._call_tier(route.path, messages, decision, params or {})
         except Exception as exc:
             decision.error = str(exc)
             decision.latency_ms = (time.perf_counter() - t0) * 1000
@@ -281,13 +283,15 @@ class Router:
         return content, decision
 
     async def _call_tier(
-        self, role: str, messages: list[dict], decision: RoutingDecision
+        self, role: str, messages: list[dict], decision: RoutingDecision,
+        params: dict | None = None,
     ) -> str:
         """Single call to a named catalog tier."""
         spec = self._catalog.by_role(role)
         decision.cascade_path.append(spec.id)
         resp = await call_model(
-            spec.id, messages, timeout_s=settings.model_timeout_s, spec=spec
+            spec.id, messages, timeout_s=settings.model_timeout_s, spec=spec,
+            **(params or {})
         )
         decision.final_model = spec.id
         decision.input_tokens += resp.input_tokens

@@ -140,6 +140,16 @@ async def call_model(
     """
     timeout_s = timeout_s or settings.model_timeout_s
 
+    if spec is None and params:
+        from smartroute.catalog import get_catalog
+
+        spec = get_catalog().resolve(model)
+    if spec is not None:
+        dropped = set(params) & spec.unsupported_params
+        if dropped:
+            logger.debug("dropping params unsupported by %s: %s", model, sorted(dropped))
+        params = spec.filter_params(params)
+
     async def _attempt() -> ModelResponse:
         t0 = time.perf_counter()
         try:
