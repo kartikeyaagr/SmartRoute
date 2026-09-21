@@ -18,6 +18,9 @@ ml = [
     "transformers>=4.40",
     "torch>=2.2",
     "sentence-transformers>=3.0",
+    # layer-1 triage heads: logistic regression over frozen MiniLM embeddings
+    "scikit-learn>=1.5",
+    "joblib>=1.4",
 ]
 # uv sync --extra bench — MMLU benchmark harness
 bench = [

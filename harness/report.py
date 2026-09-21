@@ -1,13 +1,13 @@
 """
 SmartRoute Benchmark Report Generator.
 
-Reads result JSONLs from bench/results/, computes per-mode stats,
+Reads result JSONLs from harness/results/, computes per-mode stats,
 writes both machine-readable JSON and a markdown table.
 
 Usage:
-  uv run bench/report.py                          # auto-discover latest run per mode
-  uv run bench/report.py --results-dir bench/results/
-  uv run bench/report.py --files f1.jsonl f2.jsonl f3.jsonl f4.jsonl
+  uv run harness/report.py                          # auto-discover latest run per mode
+  uv run harness/report.py --results-dir harness/results/
+  uv run harness/report.py --files f1.jsonl f2.jsonl f3.jsonl f4.jsonl
 """
 
 import argparse
@@ -276,7 +276,7 @@ def main() -> None:
 
     if not file_map:
         print(f"No result files found in {args.results_dir}")
-        print("Run benchmark first: uv run bench/run_benchmark.py --all-modes")
+        print("Run benchmark first: uv run harness/run_benchmark.py --all-modes")
         sys.exit(1)
 
     print(f"Found {len(file_map)} result file(s):")
