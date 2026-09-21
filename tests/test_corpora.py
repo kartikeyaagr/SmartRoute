@@ -129,11 +129,39 @@ class TestHotpotQAGrading:
 
 
 class TestRegistry:
-    def test_every_dataset_declares_a_distinct_expected_path(self):
-        """One dataset per routing destination — that is the point of the suite."""
-        paths = {cls.name: cls.expected_path for cls in DATASETS.values()}
+    def test_academic_sets_cover_one_routing_destination_each(self):
+        """The academic sets label a whole dataset at once, one per destination."""
+        paths = {n: DATASETS[n].expected_path for n in ("mmlu", "triviaqa", "hotpotqa")}
         assert paths == {"mmlu": ATOMIC, "triviaqa": LOOKUP, "hotpotqa": DECOMPOSE}
         assert len(set(paths.values())) == 3
+
+    def test_synthetic_is_the_default_and_labels_per_item(self):
+        """
+        The synthetic corpus carries all three destinations in one file, labelled per
+        question — which is what lets one corpus both train and evaluate the router.
+        """
+        from harness.corpora import DEFAULT_DATASETS, SyntheticDataset
+
+        assert DEFAULT_DATASETS == ["synthetic"]
+        examples = SyntheticDataset().load()
+        assert len(examples) == 200
+        assert {e.expected_path for e in examples} == {LOOKUP, ATOMIC, DECOMPOSE}
+
+    def test_synthetic_grading_rejects_wrong_and_evasive_answers(self):
+        """Keyword grading is only useful if it actually says no."""
+        from harness.corpora import SyntheticDataset
+
+        ds = SyntheticDataset()
+        item = next(e for e in ds.load() if "capital of Australia" in e.prompt)
+        assert ds.grade(item, "Canberra is the capital.")[0]
+        assert not ds.grade(item, "The capital of Australia is Sydney.")[0]
+        assert ds.grade(item, "   ") == (False, True)
+
+    def test_synthetic_every_item_has_assertions(self):
+        """An item with no assertions is unconditionally correct and inflates accuracy."""
+        from harness.corpora import SyntheticDataset
+
+        assert all(e.metadata["must_include"] for e in SyntheticDataset().load())
 
     def test_get_dataset_rejects_unknown(self):
         with pytest.raises(ValueError, match="unknown dataset"):
