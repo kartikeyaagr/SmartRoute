@@ -413,3 +413,27 @@ class TestProviderSwapAcceptance:
 
             assert decision.final_model == "groq/qwen/qwen3-32b"  # the swapped middle tier
             assert decision.route_path == "middle"
+
+
+class TestDecisionKnob:
+    def test_lambda_defaults_when_absent(self, tmp_path):
+        assert load_catalog(write_catalog(tmp_path, VALID)).lambda_wrong_answer_usd == 0.001
+
+    def test_lambda_is_read_from_yaml(self, tmp_path):
+        path = write_catalog(tmp_path, VALID + "    decision:\n      lambda_wrong_answer_usd: 0.05\n")
+        assert load_catalog(path).lambda_wrong_answer_usd == 0.05
+
+    def test_negative_lambda_rejected(self, tmp_path):
+        path = write_catalog(tmp_path, VALID + "    decision:\n      lambda_wrong_answer_usd: -1\n")
+        with pytest.raises(CatalogError, match="must be >= 0"):
+            load_catalog(path)
+
+    def test_decision_layer_picks_up_the_catalog_knob(self, tmp_path):
+        """The README promises this knob lives in models.yaml; hold it to that."""
+        from smartroute.decision import DecisionLayer, HeuristicTriage
+
+        path = write_catalog(tmp_path, VALID + "    decision:\n      lambda_wrong_answer_usd: 0.02\n")
+        layer = DecisionLayer(catalog=load_catalog(path), triage=HeuristicTriage())
+        assert layer._lambda == 0.02
+        # higher lambda => stricter precision bar for diverting to the cheap tier
+        assert layer.required_lookup_precision() > 0.9

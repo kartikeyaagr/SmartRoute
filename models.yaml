@@ -54,3 +54,17 @@ routing:
   tiers: [cheap, middle, frontier]
   # The tier every non-lookup request falls back to. Deliberately not `frontier`.
   default_tier: middle
+
+decision:
+  # What a wrong answer costs you, in dollars. The single operator knob.
+  #
+  # It sets how precise layer 1 must be before it may divert to the cheap tier:
+  # diverting saves (middle - cheap) when right and costs this when wrong, so
+  # breaking even needs precision = lambda / (saving + lambda).
+  #
+  #   $0.0005 -> 79.0% precision required
+  #   $0.0010 -> 88.3%
+  #   $0.0100 -> 98.7%   (higher than the head can deliver; layer 1 disables itself)
+  #
+  # Raise it for high-stakes traffic, lower it for high-volume low-stakes traffic.
+  lambda_wrong_answer_usd: 0.001
