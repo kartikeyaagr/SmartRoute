@@ -348,25 +348,68 @@ class TestProviderSwapAcceptance:
         """The Router must pick up swapped models without touching src/."""
         from unittest.mock import patch
 
-        from smartroute.classifier import DifficultyTier
+        from smartroute.decision import DecisionLayer, TriageSignals
         from smartroute.providers import ModelResponse
         from smartroute.router import Router
 
         catalog = load_catalog(write_catalog(tmp_path, self.GROQ))
 
-        class _AlwaysHard:
-            def classify(self, messages):
-                return DifficultyTier.HARD, 1.0
+        class _AlwaysLookup:
+            def signals(self, prompt):
+                return TriageSignals(p_lookup=0.99, p_decompose=0.0, backend="test")
 
             def backend(self):
                 return "test"
 
-        router = Router(classifier=_AlwaysHard(), catalog=catalog)
+        router = Router(
+            catalog=catalog,
+            decision_layer=DecisionLayer(catalog=catalog, triage=_AlwaysLookup()),
+        )
         resp = ModelResponse(
-            model="groq/llama-3.3-70b-versatile", content="ok",
-            input_tokens=10, output_tokens=5, estimated_cost_usd=0.0, latency_ms=1.0,
+            model="x", content="ok", input_tokens=10, output_tokens=5,
+            estimated_cost_usd=0.0, latency_ms=1.0,
         )
         with patch("smartroute.router.call_model", return_value=resp):
             _, decision = await router.route_async([{"role": "user", "content": "hi"}])
 
-        assert decision.final_model == "groq/llama-3.3-70b-versatile"
+        # resolved from the swapped catalog, with no source edit anywhere
+        assert decision.final_model == "groq/llama-3.1-8b-instant"
+        assert decision.route_path == "cheap"
+
+    async def test_default_tier_follows_the_swapped_catalog(self):
+        """The default destination is whatever the catalog says, not a constant."""
+        import textwrap
+        from pathlib import Path
+        from unittest.mock import patch
+
+        from smartroute.decision import DecisionLayer, TriageSignals
+        from smartroute.providers import ModelResponse
+        from smartroute.router import Router
+
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "models.yaml"
+            path.write_text(textwrap.dedent(self.GROQ))
+            catalog = load_catalog(path)
+
+            class _Unsure:
+                def signals(self, prompt):
+                    return TriageSignals(p_lookup=0.1, p_decompose=0.1, backend="test")
+
+                def backend(self):
+                    return "test"
+
+            router = Router(
+                catalog=catalog,
+                decision_layer=DecisionLayer(catalog=catalog, triage=_Unsure()),
+            )
+            resp = ModelResponse(
+                model="x", content="ok", input_tokens=10, output_tokens=5,
+                estimated_cost_usd=0.0, latency_ms=1.0,
+            )
+            with patch("smartroute.router.call_model", return_value=resp):
+                _, decision = await router.route_async([{"role": "user", "content": "hi"}])
+
+            assert decision.final_model == "groq/qwen/qwen3-32b"  # the swapped middle tier
+            assert decision.route_path == "middle"

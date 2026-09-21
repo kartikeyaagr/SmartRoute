@@ -111,6 +111,11 @@ class _SmartRouteMeta(BaseModel):
     estimated_cost_usd: float
     latency_ms: float
     classifier_backend: str
+    # Two-layer decision fields. Defaulted so a cascade-mode router still serialises.
+    route_path: str = ""
+    gate_reason: str = ""
+    projected_cost_usd: float = 0.0
+    subtask_count: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -181,6 +186,8 @@ async def chat_completions(body: ChatCompletionRequest) -> JSONResponse:
         span.set_attribute("smartroute.latency_ms", decision.latency_ms)
         span.set_attribute("smartroute.cost_usd", decision.estimated_cost_usd)
         span.set_attribute("smartroute.cache_hit", decision.cache_hit)
+        span.set_attribute("smartroute.route_path", decision.route_path)
+        span.set_attribute("smartroute.subtask_count", decision.subtask_count)
 
     await _db.insert_decision(decision)
     _obs.record_decision(decision)
@@ -194,6 +201,10 @@ async def chat_completions(body: ChatCompletionRequest) -> JSONResponse:
         estimated_cost_usd=decision.estimated_cost_usd,
         latency_ms=decision.latency_ms,
         classifier_backend=decision.classifier_backend,
+        route_path=decision.route_path,
+        gate_reason=decision.gate_reason,
+        projected_cost_usd=decision.projected_cost_usd,
+        subtask_count=decision.subtask_count,
     )
 
     if body.stream:

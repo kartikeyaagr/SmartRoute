@@ -52,3 +52,25 @@ def test_catalog(catalog_path, request):
     set_catalog(catalog)
     yield catalog
     set_catalog(None)
+
+
+@pytest.fixture(autouse=True)
+def fast_triage(monkeypatch, request):
+    """
+    Keep EmbeddingTriage off the real encoder in tests.
+
+    Loading all-MiniLM-L6-v2 takes seconds per construction and turned the suite from
+    2s into 107s. Tests that specifically exercise the learned head opt out with
+    @pytest.mark.real_triage.
+    """
+    if request.node.get_closest_marker("real_triage"):
+        yield
+        return
+
+    from smartroute.decision import EmbeddingTriage, HeuristicTriage
+
+    heuristic = HeuristicTriage()
+    monkeypatch.setattr(EmbeddingTriage, "_load", lambda self: None)
+    monkeypatch.setattr(EmbeddingTriage, "signals", lambda self, prompt: heuristic.signals(prompt))
+    monkeypatch.setattr(EmbeddingTriage, "backend", lambda self: "heuristic")
+    yield

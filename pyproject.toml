@@ -69,4 +69,5 @@ testpaths = ["tests"]
 pythonpath = ["src"]
 markers = [
     "integration: requires real API keys (skipped by default)",
+    "real_triage: loads the real sentence-transformers encoder (slow)",
 ]
