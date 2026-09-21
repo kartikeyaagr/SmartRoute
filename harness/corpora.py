@@ -254,15 +254,75 @@ class HotpotQADataset:
         return token_f1(response, example.answer) >= 0.6, False
 
 
+class SyntheticDataset:
+    """
+    The 200-question corpus written for this project (harness/data/synthetic_corpus.py).
+
+    Replaces the academic sets as the primary benchmark. MMLU is 4-way multiple choice,
+    TriviaQA is deliberately obscure, and HotpotQA's 2-hop questions are synthetically
+    welded together — none of it resembles what an assistant is actually asked, so
+    routing tuned on that traffic is tuned on the wrong distribution.
+
+    Graded on `must_include`: a list of requirements, each a string that must appear or
+    a list of acceptable alternatives. Deterministic, free, and no LLM judge.
+
+    Sub-sets are exposed by category so the per-tier priors can be read off per kind of
+    request rather than averaged into a single meaningless number.
+    """
+
+    name = "synthetic"
+    expected_path = ATOMIC  # per-item; this is only the registry default
+
+    def __init__(self, path: Path | None = None, category: str | None = None) -> None:
+        self._path = path or DATA_DIR / "synthetic_200.jsonl"
+        self._category = category
+
+    def load(self, n: int | None = None, seed: int = 42) -> list[Example]:
+        rows = _read_jsonl(self._path)
+        if self._category:
+            rows = [r for r in rows if r["category"] == self._category]
+        rows = _sample(rows, n, seed)
+        return [
+            Example(
+                source_id=r["source_id"],
+                prompt=r["prompt"],
+                answer="",  # graded by assertion, not by a single gold string
+                dataset=self.name,
+                expected_path=r["expected_path"],
+                metadata={"category": r["category"], "must_include": r["must_include"]},
+            )
+            for r in rows
+        ]
+
+    def system_prompt(self) -> str:
+        # No format coercion beyond brevity: the point is to measure models on the
+        # register a user actually writes in, not on instruction-following.
+        return "Answer the question directly and concisely."
+
+    def grade(self, example: Example, response: str) -> tuple[bool, bool]:
+        if not response.strip():
+            return False, True
+        text = normalize_answer(response)
+        for requirement in example.metadata.get("must_include", []):
+            alternatives = [requirement] if isinstance(requirement, str) else requirement
+            if not any(normalize_answer(a) in text for a in alternatives if a):
+                return False, False
+        return True, False
+
+
 # ---------------------------------------------------------------------------
 # Registry and the mixed stream
 # ---------------------------------------------------------------------------
 
 DATASETS: dict[str, type] = {
+    SyntheticDataset.name: SyntheticDataset,
     MMLUDataset.name: MMLUDataset,
     TriviaQADataset.name: TriviaQADataset,
     HotpotQADataset.name: HotpotQADataset,
 }
+
+# The academic sets are kept for comparison but are no longer the default benchmark.
+DEFAULT_DATASETS = [SyntheticDataset.name]
 
 
 def get_dataset(name: str) -> Dataset:
@@ -283,7 +343,7 @@ def mixed_stream(
     provenance, does each item still reach the tier its dataset implies?
     """
     pairs: list[tuple[Example, Dataset]] = []
-    for name in names or list(DATASETS):
+    for name in names or DEFAULT_DATASETS:
         dataset = get_dataset(name)
         pairs.extend((ex, dataset) for ex in dataset.load(per_dataset, seed=seed))
     random.Random(seed).shuffle(pairs)

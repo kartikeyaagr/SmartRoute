@@ -39,8 +39,15 @@ ARMS = ["routed", "always-cheap", "always-middle", "always-frontier"]
 RESULTS_DIR = Path(__file__).parent / "results"
 
 # Pinned so a rerun is comparable. Without temperature=0 the same prompt can change
-# answer between arms and the accuracy delta becomes noise.
-GEN_PARAMS = {"temperature": 0, "max_tokens": 512}
+# answer between arms and the accuracy delta becomes noise. (Models that reject
+# temperature have it stripped by the catalog — see ModelSpec.unsupported_params.)
+#
+# max_tokens must be generous enough never to bind. At 512 the stronger models hit the
+# cap on 108/200 prompts while the cheapest hit it on 8, so their answers were truncated
+# before the graded content appeared and they scored *worse* — an artifact of the
+# budget, not a quality difference. Opus additionally returned 11 empty responses,
+# having spent the whole budget on reasoning tokens before emitting any text.
+GEN_PARAMS = {"temperature": 0, "max_tokens": 2000}
 
 
 @dataclass
@@ -48,6 +55,7 @@ class PromptResult:
     source_id: str
     dataset: str
     expected_path: str
+    category: str = ""
     route_path: str = ""
     gate_reason: str = ""
     p_lookup: float | None = None
@@ -81,6 +89,7 @@ async def run_one(example, dataset, arm, router, catalog, sem, out_path) -> Prom
         source_id=example.source_id,
         dataset=example.dataset,
         expected_path=example.expected_path,
+        category=example.metadata.get("category", ""),
     )
     messages = [
         {"role": "system", "content": dataset.system_prompt()},
@@ -132,7 +141,8 @@ def summarise(arm: str, results: list[PromptResult]) -> dict:
 
     by_dataset = {}
     for r in ok:
-        d = by_dataset.setdefault(r.dataset, {"n": 0, "correct": 0, "cost": 0.0, "paths": {}})
+        key = r.category or r.dataset
+        d = by_dataset.setdefault(key, {"n": 0, "correct": 0, "cost": 0.0, "paths": {}})
         d["n"] += 1
         d["correct"] += int(r.is_correct)
         d["cost"] += r.cost_usd
@@ -217,7 +227,9 @@ def estimate(catalog, n: int, arms: list[str]) -> float:
 
 async def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--n", type=int, default=200, help="prompts total, split across the 3 corpora")
+    ap.add_argument("--n", type=int, default=200, help="prompts total, split across the corpora in use")
+    ap.add_argument("--datasets", type=str, default=None,
+                    help="comma-separated corpora (default: the synthetic 200)")
     ap.add_argument("--arm", choices=ARMS + ["all"], default="routed")
     ap.add_argument("--catalog", type=str, default=None)
     ap.add_argument("--concurrency", type=int, default=8)
@@ -238,11 +250,16 @@ async def main() -> None:
         sys.exit(f"missing credentials: {', '.join(missing)}")
 
     arms = ARMS if args.arm == "all" else [args.arm]
-    per_dataset = max(1, args.n // 3)
-    pairs = mixed_stream(per_dataset=per_dataset, seed=args.seed)
+    from harness.corpora import DEFAULT_DATASETS
+
+    names = args.datasets.split(",") if args.datasets else DEFAULT_DATASETS
+    # n is the total, so split it across however many corpora are in play.
+    per_dataset = max(1, args.n // len(names))
+    pairs = mixed_stream(per_dataset=per_dataset, seed=args.seed, names=names)
 
     print(f"catalog: {[f'{m.alias}={m.id}' for m in catalog.tiers]}")
     print(f"fingerprint: {catalog.fingerprint()}")
+    print(f"corpora: {names}")
     print(f"prompts: {len(pairs)} ({per_dataset} per corpus)   arms: {arms}")
 
     projected = estimate(catalog, len(pairs), arms)
