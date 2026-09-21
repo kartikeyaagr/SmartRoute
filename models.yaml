@@ -1,0 +1,56 @@
+# SmartRoute model catalog — the single source of truth for which models exist,
+# what they cost, and what role they play in routing.
+#
+# Swapping providers should mean editing THIS FILE ONLY. If a provider swap ever
+# requires a source edit again, that is a bug in catalog.py.
+#
+# Prices are resolved in this order:
+#   1. an explicit `price:` block here (override — use when the registry is wrong/missing)
+#   2. litellm.model_cost[id]                (the shared registry, 4326 models)
+#   3. error — UnpricedModelError. Never a silent $0.
+
+version: 1
+
+models:
+  # ---- cheap: "google-substitute" lookups only -----------------------------
+  # gpt-oss-20b strictly dominates the previously-configured Llama-3.1-8B:
+  # $0.05/M vs $0.18/M input, and a 20B model instead of an 8B one.
+  - alias: cheap
+    id: together_ai/openai/gpt-oss-20b
+    role: cheap
+    env_key: TOGETHERAI_API_KEY
+
+  # ---- middle: THE DEFAULT -------------------------------------------------
+  # Every request that isn't a confident lookup lands here. Also the model that
+  # performs decomposition and synthesis in layer 2, so it needs to be capable
+  # of structured planning, not just answering.
+  - alias: middle
+    id: together_ai/openai/gpt-oss-120b
+    role: middle
+    env_key: TOGETHERAI_API_KEY
+
+  # ---- frontier: sub-task target and bail-out only -------------------------
+  # Never a default destination. Qwen3.5-397B-A17B dominates the previously
+  # configured Llama-3.3-70B: $0.60/M vs $1.04/M, and a 397B MoE vs a 70B dense.
+  - alias: frontier
+    id: together_ai/Qwen/Qwen3.5-397B-A17B
+    role: frontier
+    env_key: TOGETHERAI_API_KEY
+
+  # ---- judge: scores cheap answers in the MEDIUM cascade -------------------
+  # Must be a different model family from `cheap`, or it grades its own homework —
+  # catalog.py enforces this. Mistral is neither OpenAI (cheap) nor Qwen (frontier).
+  #
+  # NOTE: the cascade verifier is under review. At $0.10/M this judge costs 0.17x a
+  # frontier call, where the previously configured Qwen2.5-72B ($1.20/M) cost 1.44x —
+  # i.e. more than the call it existed to avoid. See tasks/todo.md (deferred phase).
+  - alias: judge
+    id: together_ai/mistralai/Mistral-Small-24B-Instruct-2501
+    role: judge
+    env_key: TOGETHERAI_API_KEY
+
+routing:
+  # Ordered cheap → expensive. Layer 2 picks a tier per sub-task from this list.
+  tiers: [cheap, middle, frontier]
+  # The tier every non-lookup request falls back to. Deliberately not `frontier`.
+  default_tier: middle

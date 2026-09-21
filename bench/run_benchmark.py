@@ -5,7 +5,7 @@ Modes:
   1 / routing-only    — classifier decides tier, no verifier, cheap or frontier directly
   2 / cascade-only    — all prompts treated as MEDIUM (cheap → verifier → maybe frontier)
   3 / full            — classifier + cascade (full SmartRoute)
-  4 / always-frontier — all prompts → frontier model (baseline, see router._FRONTIER_SEQUENCE)
+  4 / always-frontier — all prompts → frontier model (baseline, see models.yaml)
 
 Usage:
   uv run bench/run_benchmark.py --mode routing-only --dry-run
@@ -32,8 +32,9 @@ sys.path.insert(0, str(_REPO_ROOT / "src"))
 
 from smartroute.classifier import DifficultyClassifier, DifficultyTier, get_classifier
 from smartroute.config import settings
-from smartroute.providers import ProviderError, call_model, _MANUAL_PRICING
-from smartroute.router import Router, RoutingDecision, _CHEAP_SEQUENCE, _FRONTIER_SEQUENCE
+from smartroute.catalog import get_catalog
+from smartroute.providers import ProviderError, call_model
+from smartroute.router import Router, RoutingDecision
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -44,15 +45,12 @@ VALID_ANSWERS = {"A", "B", "C", "D"}
 DATA_PATH = Path(__file__).parent / "data" / "mmlu_500.jsonl"
 RESULTS_DIR = Path(__file__).parent / "results"
 
-# Derived from router config — single source of truth
-_CHEAP_MODEL = _CHEAP_SEQUENCE[0]
-_FRONTIER_MODEL = _FRONTIER_SEQUENCE[0]
-
-# Per-1K-token pricing for cost estimation (input, output)
-_COST_PER_1K: dict[str, tuple[float, float]] = {
-    model: (in_rate * 1000, out_rate * 1000)
-    for model, (in_rate, out_rate) in _MANUAL_PRICING.items()
-}
+# Derived from the catalog — single source of truth for models AND prices.
+_CATALOG = get_catalog()
+_CHEAP_SPEC = _CATALOG.by_role("cheap")
+_FRONTIER_SPEC = _CATALOG.by_role("frontier")
+_CHEAP_MODEL = _CHEAP_SPEC.id
+_FRONTIER_MODEL = _FRONTIER_SPEC.id
 
 _AVG_MMLU_INPUT_TOKENS = 200
 _AVG_OUTPUT_TOKENS = 3
@@ -155,28 +153,19 @@ def extract_answer(response: str) -> tuple[str, bool]:
 # Preflight
 # ---------------------------------------------------------------------------
 
-def _has_key_for(model: str) -> bool:
-    """Check that the relevant provider API key is set for the given model string."""
-    if model.startswith("groq/"):
-        return bool(settings.groq_api_key)
-    if model.startswith("together_ai/"):
-        return bool(settings.togetherai_api_key)
-    if model.startswith("gpt") or "openai" in model:
-        return bool(settings.openai_api_key)
-    if "anthropic" in model or "claude" in model:
-        return bool(settings.anthropic_api_key)
-    if "gemini" in model:
-        return bool(settings.gemini_api_key)
-    return True  # unknown provider — let it fail at runtime
-
-
 def preflight(mode: str) -> list[str]:
-    issues = []
-    if not _has_key_for(_FRONTIER_MODEL):
-        issues.append(f"API key missing for frontier model: {_FRONTIER_MODEL}")
-    if mode != "always-frontier" and not _has_key_for(_CHEAP_MODEL):
-        issues.append(f"API key missing for cheap model: {_CHEAP_MODEL}")
-    return issues
+    """
+    Which credentials are missing, derived from the catalog.
+
+    Previously this hand-matched provider prefixes to settings fields and had drifted:
+    it tested `settings.openai_api_key` while reporting `GROQ_API_KEY` missing. Reading
+    `env_key` off each ModelSpec means preflight cannot disagree with the catalog.
+    """
+    aliases = ["frontier"] if mode == "always-frontier" else ["cheap", "frontier"]
+    return [
+        f"{key} is not set (required by: {', '.join(aliases)})"
+        for key in _CATALOG.missing_credentials(aliases)
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -184,10 +173,8 @@ def preflight(mode: str) -> list[str]:
 # ---------------------------------------------------------------------------
 
 def _cost_per_prompt(model: str) -> float:
-    if model not in _COST_PER_1K:
-        return 0.0
-    in_rate, out_rate = _COST_PER_1K[model]
-    return (_AVG_MMLU_INPUT_TOKENS * in_rate + _AVG_OUTPUT_TOKENS * out_rate) / 1000
+    """Estimated cost of one average prompt, priced from the catalog."""
+    return _CATALOG.resolve(model).cost(_AVG_MMLU_INPUT_TOKENS, _AVG_OUTPUT_TOKENS)
 
 
 def estimate_cost(mode: str, rows: list[dict]) -> float:
