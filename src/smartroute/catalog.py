@@ -73,9 +73,19 @@ class ModelSpec:
     price: Price
     env_key: str | None = None
     context_window: int | None = None
+    # Generation params this model rejects outright. Newer Claude models return
+    # `invalid_request_error: temperature is deprecated for this model`, and an
+    # unrecognised param is a hard 400, not a warning — so a benchmark that pins
+    # temperature for reproducibility fails 100% against them while older models in
+    # the same family sail through. Which params a model accepts is a property of the
+    # model, so it belongs next to its price rather than in caller code.
+    unsupported_params: frozenset[str] = frozenset()
 
     def cost(self, input_tokens: int, output_tokens: int) -> float:
         return self.price.cost(input_tokens, output_tokens)
+
+    def filter_params(self, params: dict) -> dict:
+        return {k: v for k, v in params.items() if k not in self.unsupported_params}
 
 
 def _registry_entry(model_id: str) -> dict | None:
@@ -292,6 +302,7 @@ def load_catalog(path: str | Path | None = None) -> Catalog:
                 price=_resolve_price(alias, model_id, entry.get("price")),
                 env_key=entry.get("env_key"),
                 context_window=_resolve_context_window(model_id, entry.get("context_window")),
+                unsupported_params=frozenset(entry.get("unsupported_params") or ()),
             )
         )
 

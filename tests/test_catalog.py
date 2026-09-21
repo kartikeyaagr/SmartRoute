@@ -437,3 +437,68 @@ class TestDecisionKnob:
         assert layer._lambda == 0.02
         # higher lambda => stricter precision bar for diverting to the cheap tier
         assert layer.required_lookup_precision() > 0.9
+
+
+class TestUnsupportedParams:
+    """
+    Newer Claude models return a hard 400 on `temperature`, older ones in the same
+    family accept it. An unrecognised param is not a warning, so pinning temperature
+    for reproducibility silently fails 100% of calls against half a ladder.
+    """
+
+    def test_declared_params_are_filtered_out(self, tmp_path):
+        path = write_catalog(
+            tmp_path,
+            f"""
+            version: 1
+            models:
+              - alias: cheap
+                id: {CHEAP_ID}
+                role: cheap
+                unsupported_params: [temperature]
+            routing: {{tiers: [cheap], default_tier: cheap}}
+            """,
+        )
+        spec = load_catalog(path).by_role("cheap")
+        assert spec.filter_params({"temperature": 0, "max_tokens": 64}) == {"max_tokens": 64}
+
+    def test_default_is_no_filtering(self, tmp_path):
+        spec = load_catalog(write_catalog(tmp_path, VALID)).by_role("cheap")
+        params = {"temperature": 0, "max_tokens": 64}
+        assert spec.filter_params(params) == params
+
+    async def test_call_model_strips_them_before_the_provider_sees_them(self, tmp_path):
+        from unittest.mock import patch
+
+        from smartroute.providers import call_model
+
+        path = write_catalog(
+            tmp_path,
+            f"""
+            version: 1
+            models:
+              - alias: cheap
+                id: {CHEAP_ID}
+                role: cheap
+                unsupported_params: [temperature]
+            routing: {{tiers: [cheap], default_tier: cheap}}
+            """,
+        )
+        spec = load_catalog(path).by_role("cheap")
+        seen = {}
+
+        async def record(**kwargs):
+            seen.update(kwargs)
+            response = type("R", (), {})()
+            response.usage = type("U", (), {"prompt_tokens": 1, "completion_tokens": 1})()
+            choice = type("C", (), {})()
+            choice.message = type("M", (), {"content": "ok"})()
+            response.choices = [choice]
+            return response
+
+        with patch("smartroute.providers.acompletion", side_effect=record):
+            await call_model(spec.id, [{"role": "user", "content": "hi"}],
+                             spec=spec, temperature=0, max_tokens=64)
+
+        assert "temperature" not in seen
+        assert seen["max_tokens"] == 64
