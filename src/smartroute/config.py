@@ -17,6 +17,9 @@ class Settings(BaseSettings):
     groq_api_key: str = ""
     togetherai_api_key: str = ""
 
+    # Model catalog — path to models.yaml. Empty = repo-root models.yaml.
+    catalog_path: str = ""
+
     # Classifier
     classifier: str = "keyword"  # "keyword" or "deberta"
     classifier_fallback_timeout_ms: float = 2000.0  # fallback if DeBERTa warmup > this

@@ -15,6 +15,8 @@ from smartroute.providers import ModelResponse, ProviderError
 from smartroute.router import Router, RoutingDecision
 from smartroute.verifier import CascadeVerifier, _pick_verifier, _parse_score
 
+from tests.conftest import CHEAP_ID, FRONTIER_ID, JUDGE_ID
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -24,7 +26,7 @@ def _messages(text: str = "What is 2+2?") -> list[dict]:
     return [{"role": "user", "content": text}]
 
 
-def _mock_response(content: str = "4", model: str = "groq/llama-3.1-8b-instant") -> ModelResponse:
+def _mock_response(content: str = "4", model: str = CHEAP_ID) -> ModelResponse:
     return ModelResponse(
         model=model,
         content=content,
@@ -52,13 +54,13 @@ def _make_verifier(score: int) -> CascadeVerifier:
 # Verifier unit tests
 # ---------------------------------------------------------------------------
 
-def test_pick_verifier_groq_small_uses_qwen():
+def test_pick_verifier_uses_catalog_judge():
     # llama-8b cheap → qwen3-32b verifier (Alibaba arch, different from Meta Llama)
-    assert _pick_verifier("groq/llama-3.1-8b-instant") == "groq/qwen/qwen3-32b"
+    assert _pick_verifier(CHEAP_ID).id == JUDGE_ID
 
 
 def test_pick_verifier_unknown_uses_default():
-    assert _pick_verifier("unknown/model") == "groq/qwen/qwen3-32b"
+    assert _pick_verifier("unknown/model").id == JUDGE_ID
 
 
 def test_parse_score_valid():
@@ -90,7 +92,7 @@ async def test_easy_route_no_verifier():
     assert content == "Paris"
     assert decision.verifier_score is None
     assert decision.escalated is False
-    assert decision.final_model == "groq/llama-3.1-8b-instant"
+    assert decision.final_model == CHEAP_ID
     verifier.score_async.assert_not_called()
 
 
@@ -108,7 +110,7 @@ async def test_medium_route_verifier_passes():
     assert content == "Backprop works by..."
     assert decision.verifier_score == 4
     assert decision.escalated is False
-    assert decision.final_model == "groq/llama-3.1-8b-instant"
+    assert decision.final_model == CHEAP_ID
 
 
 @pytest.mark.asyncio
@@ -117,8 +119,8 @@ async def test_medium_route_verifier_escalates():
     clf = _make_classifier(DifficultyTier.MEDIUM)
     verifier = _make_verifier(score=2)
 
-    cheap_resp = _mock_response("bad answer", model="groq/llama-3.1-8b-instant")
-    frontier_resp = _mock_response("good answer", model="groq/llama-3.3-70b-versatile")
+    cheap_resp = _mock_response("bad answer", model=CHEAP_ID)
+    frontier_resp = _mock_response("good answer", model=FRONTIER_ID)
 
     call_sequence = [cheap_resp, frontier_resp]
 
@@ -130,7 +132,7 @@ async def test_medium_route_verifier_escalates():
     assert content == "good answer"
     assert decision.verifier_score == 2
     assert decision.escalated is True
-    assert decision.final_model == "groq/llama-3.3-70b-versatile"
+    assert decision.final_model == FRONTIER_ID
 
 
 @pytest.mark.asyncio
@@ -140,16 +142,16 @@ async def test_hard_route_direct_frontier():
     verifier = _make_verifier(score=5)
 
     with patch("smartroute.router.call_model", new_callable=AsyncMock) as mock_call:
-        mock_call.return_value = _mock_response("Proof by induction...", model="groq/llama-3.3-70b-versatile")
+        mock_call.return_value = _mock_response("Proof by induction...", model=FRONTIER_ID)
         router = Router(classifier=clf, verifier=verifier)
         content, decision = await router.route_async(_messages("Prove infinitely many primes"))
 
     assert content == "Proof by induction..."
-    assert decision.final_model == "groq/llama-3.3-70b-versatile"
+    assert decision.final_model == FRONTIER_ID
     assert decision.verifier_score is None
     verifier.score_async.assert_not_called()
     # Should not have tried any cheap model
-    assert not any(m in decision.cascade_path for m in ["groq/llama-3.1-8b-instant", "groq/gemma2-9b-it"])
+    assert CHEAP_ID not in decision.cascade_path
 
 
 @pytest.mark.asyncio
@@ -161,14 +163,14 @@ async def test_cheap_tier_unavailable_fallthrough():
     with patch("smartroute.router.call_model", new_callable=AsyncMock) as mock_call:
         mock_call.side_effect = [
             ProviderError("llama-8b down"),
-            _mock_response("frontier saved us", model="groq/llama-3.3-70b-versatile"),
+            _mock_response("frontier saved us", model=FRONTIER_ID),
         ]
         router = Router(classifier=clf, verifier=verifier)
         content, decision = await router.route_async(_messages())
 
     assert content == "frontier saved us"
-    assert decision.final_model == "groq/llama-3.3-70b-versatile"
-    assert "groq/llama-3.1-8b-instant" in decision.cascade_path
+    assert decision.final_model == FRONTIER_ID
+    assert CHEAP_ID in decision.cascade_path
     assert decision.escalated is True
 
 
@@ -191,8 +193,8 @@ async def test_verifier_parse_failure_escalates():
     # Simulate parse failure: verifier returns 2 (confidence=2 sentinel)
     verifier = _make_verifier(score=2)
 
-    cheap_resp = _mock_response("meh answer", model="groq/llama-3.1-8b-instant")
-    frontier_resp = _mock_response("great answer", model="groq/llama-3.3-70b-versatile")
+    cheap_resp = _mock_response("meh answer", model=CHEAP_ID)
+    frontier_resp = _mock_response("great answer", model=FRONTIER_ID)
 
     with patch("smartroute.router.call_model", new_callable=AsyncMock) as mock_call:
         mock_call.side_effect = [cheap_resp, frontier_resp]
@@ -201,7 +203,7 @@ async def test_verifier_parse_failure_escalates():
 
     assert content == "great answer"
     assert decision.escalated is True
-    assert decision.final_model == "groq/llama-3.3-70b-versatile"
+    assert decision.final_model == FRONTIER_ID
 
 
 @pytest.mark.asyncio
@@ -210,17 +212,17 @@ async def test_cascade_path_in_routing_decision():
     clf = _make_classifier(DifficultyTier.MEDIUM)
     verifier = _make_verifier(score=2)  # force escalation
 
-    cheap_resp = _mock_response("cheap", model="groq/llama-3.1-8b-instant")
-    frontier_resp = _mock_response("frontier", model="groq/llama-3.3-70b-versatile")
+    cheap_resp = _mock_response("cheap", model=CHEAP_ID)
+    frontier_resp = _mock_response("frontier", model=FRONTIER_ID)
 
     with patch("smartroute.router.call_model", new_callable=AsyncMock) as mock_call:
         mock_call.side_effect = [cheap_resp, frontier_resp]
         router = Router(classifier=clf, verifier=verifier)
         _, decision = await router.route_async(_messages("Medium question"))
 
-    assert "groq/llama-3.1-8b-instant" in decision.cascade_path
-    assert "groq/llama-3.3-70b-versatile" in decision.cascade_path
-    assert decision.cascade_path.index("groq/llama-3.1-8b-instant") < decision.cascade_path.index("groq/llama-3.3-70b-versatile")
+    assert CHEAP_ID in decision.cascade_path
+    assert FRONTIER_ID in decision.cascade_path
+    assert decision.cascade_path.index(CHEAP_ID) < decision.cascade_path.index(FRONTIER_ID)
 
 
 @pytest.mark.asyncio
@@ -266,8 +268,8 @@ async def test_verifier_timeout_escalates():
     verifier = MagicMock(spec=CascadeVerifier)
     verifier.score_async = AsyncMock(side_effect=ProviderError("timeout"))
 
-    cheap_resp = _mock_response("cheap answer", model="groq/llama-3.1-8b-instant")
-    frontier_resp = _mock_response("frontier answer", model="groq/llama-3.3-70b-versatile")
+    cheap_resp = _mock_response("cheap answer", model=CHEAP_ID)
+    frontier_resp = _mock_response("frontier answer", model=FRONTIER_ID)
 
     with patch("smartroute.router.call_model", new_callable=AsyncMock) as mock_call:
         mock_call.side_effect = [cheap_resp, frontier_resp]
@@ -277,7 +279,7 @@ async def test_verifier_timeout_escalates():
     assert content == "frontier answer"
     assert decision.escalated is True
     assert decision.verifier_score == 2
-    assert decision.final_model == "groq/llama-3.3-70b-versatile"
+    assert decision.final_model == FRONTIER_ID
 
 
 @pytest.mark.asyncio
@@ -302,15 +304,15 @@ async def test_cheap_sequence_fallthrough():
     with patch("smartroute.router.call_model", new_callable=AsyncMock) as mock_call:
         mock_call.side_effect = [
             ProviderError("llama-8b down"),
-            _mock_response("frontier saved us", model="groq/llama-3.3-70b-versatile"),
+            _mock_response("frontier saved us", model=FRONTIER_ID),
         ]
         router = Router(classifier=clf)
         content, decision = await router.route_async(_messages())
 
     assert content == "frontier saved us"
     assert decision.escalated is True
-    assert decision.final_model == "groq/llama-3.3-70b-versatile"
-    assert "groq/llama-3.1-8b-instant" in decision.cascade_path
+    assert decision.final_model == FRONTIER_ID
+    assert CHEAP_ID in decision.cascade_path
 
 
 @pytest.mark.asyncio
@@ -318,8 +320,8 @@ async def test_easy_refusal_escalates():
     """EASY tier: cheap model returns empty response → escalates to frontier."""
     clf = _make_classifier(DifficultyTier.EASY)
 
-    empty_resp = _mock_response("", model="groq/llama-3.1-8b-instant")
-    frontier_resp = _mock_response("Real answer", model="groq/llama-3.3-70b-versatile")
+    empty_resp = _mock_response("", model=CHEAP_ID)
+    frontier_resp = _mock_response("Real answer", model=FRONTIER_ID)
 
     with patch("smartroute.router.call_model", new_callable=AsyncMock) as mock_call:
         mock_call.side_effect = [empty_resp, frontier_resp]
@@ -328,4 +330,4 @@ async def test_easy_refusal_escalates():
 
     assert content == "Real answer"
     assert decision.escalated is True
-    assert decision.final_model == "groq/llama-3.3-70b-versatile"
+    assert decision.final_model == FRONTIER_ID

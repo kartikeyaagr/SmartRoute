@@ -8,7 +8,15 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import litellm
 import pytest
 
+from smartroute.catalog import CatalogError, ModelSpec, Price
 from smartroute.providers import ModelResponse, ProviderError, call_model
+
+# Prices are the catalog's job; these tests are about transport, so they pass an
+# explicit spec rather than depending on whatever models.yaml happens to contain.
+SPEC = ModelSpec(
+    alias="test", id="gpt-4o", role="middle",
+    price=Price(input_per_token=1e-6, output_per_token=2e-6),
+)
 
 
 def _make_litellm_response(content="Paris", model="gpt-4o", input_tokens=10, output_tokens=5):
@@ -42,7 +50,7 @@ async def test_rate_limit_retry_success():
     with patch("smartroute.providers.acompletion", side_effect=mock_acompletion):
         with patch("smartroute.providers.asyncio.sleep", new_callable=AsyncMock):
             with patch("smartroute.providers.litellm.completion_cost", return_value=0.001):
-                result = await call_model("gpt-4o", [{"role": "user", "content": "hi"}])
+                result = await call_model("gpt-4o", [{"role": "user", "content": "hi"}], spec=SPEC)
 
     assert call_count == 2
     assert isinstance(result, ModelResponse)
@@ -61,7 +69,7 @@ async def test_rate_limit_retry_exhausted():
     with patch("smartroute.providers.acompletion", side_effect=mock_acompletion):
         with patch("smartroute.providers.asyncio.sleep", new_callable=AsyncMock):
             with pytest.raises(ProviderError, match="RateLimitError"):
-                await call_model("gpt-4o", [{"role": "user", "content": "hi"}])
+                await call_model("gpt-4o", [{"role": "user", "content": "hi"}], spec=SPEC)
 
 
 @pytest.mark.asyncio
@@ -78,25 +86,57 @@ async def test_auth_failure_raises():
 
     with patch("smartroute.providers.acompletion", side_effect=mock_acompletion):
         with pytest.raises(ProviderError, match="AuthenticationError"):
-            await call_model("gpt-4o", [{"role": "user", "content": "hi"}])
+            await call_model("gpt-4o", [{"role": "user", "content": "hi"}], spec=SPEC)
 
     assert call_count == 1  # no retry on auth failures
 
 
 @pytest.mark.asyncio
-async def test_missing_pricing_defaults_zero():
-    """If LiteLLM has no pricing for model → cost=0.0, no exception raised."""
-    mock_response = _make_litellm_response()
+async def test_unknown_model_raises_instead_of_costing_zero():
+    """
+    A model absent from the catalog must fail loudly.
 
+    This replaces test_missing_pricing_defaults_zero, which asserted the opposite.
+    Recording $0.00 for an unpriced model silently corrupts the cost figures that are
+    the entire point of a cost-optimising router, so it is now an error.
+    """
     async def mock_acompletion(**kwargs):
-        return mock_response
-
-    def mock_cost(**kwargs):
-        raise Exception("no pricing data for this model")
+        return _make_litellm_response()
 
     with patch("smartroute.providers.acompletion", side_effect=mock_acompletion):
-        with patch("smartroute.providers.litellm.completion_cost", side_effect=mock_cost):
-            result = await call_model("some-unknown-model", [{"role": "user", "content": "hi"}])
+        with pytest.raises(CatalogError, match="unknown model"):
+            await call_model("some-unknown-model", [{"role": "user", "content": "hi"}])
 
-    assert result.estimated_cost_usd == 0.0
-    assert result.content == "Paris"
+
+@pytest.mark.asyncio
+async def test_cost_comes_from_the_spec_not_the_registry():
+    """Catalog price is authoritative even when litellm would price it differently."""
+    async def mock_acompletion(**kwargs):
+        return _make_litellm_response(input_tokens=1000, output_tokens=500)
+
+    with patch("smartroute.providers.acompletion", side_effect=mock_acompletion):
+        with patch("smartroute.providers.litellm.completion_cost", return_value=0.0):
+            result = await call_model("gpt-4o", [{"role": "user", "content": "hi"}], spec=SPEC)
+
+    # 1000 * 1e-6 + 500 * 2e-6
+    assert result.estimated_cost_usd == pytest.approx(0.002)
+
+
+@pytest.mark.asyncio
+async def test_extra_params_are_forwarded_to_the_provider():
+    """temperature/max_tokens/logprobs used to be accepted and silently dropped."""
+    seen = {}
+
+    async def mock_acompletion(**kwargs):
+        seen.update(kwargs)
+        return _make_litellm_response()
+
+    with patch("smartroute.providers.acompletion", side_effect=mock_acompletion):
+        await call_model(
+            "gpt-4o", [{"role": "user", "content": "hi"}],
+            spec=SPEC, temperature=0, max_tokens=64, logprobs=True,
+        )
+
+    assert seen["temperature"] == 0
+    assert seen["max_tokens"] == 64
+    assert seen["logprobs"] is True

@@ -6,8 +6,8 @@ Tiers:
   MEDIUM → cheap → verifier ≥4 → return cheap; <4 → frontier
   HARD  → frontier directly
 
-Cheap sequence:  groq/llama-3.1-8b-instant
-Frontier sequence: groq/llama-3.3-70b-versatile
+Which concrete models back "cheap" and "frontier" comes from the catalog
+(models.yaml), not from this module. Swapping providers is a catalog edit.
 """
 
 import asyncio
@@ -20,15 +20,13 @@ from dataclasses import dataclass, field, asdict
 from pathlib import Path
 
 from smartroute.cache import NoOpCache, PromptCache, get_cache
+from smartroute.catalog import Catalog, ModelSpec, get_catalog
 from smartroute.classifier import DifficultyClassifier, DifficultyTier, get_classifier
 from smartroute.config import settings
 from smartroute.providers import ProviderError, call_model
 from smartroute.verifier import CascadeVerifier
 
 logger = logging.getLogger(__name__)
-
-_CHEAP_SEQUENCE = ["together_ai/meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo"]
-_FRONTIER_SEQUENCE = ["together_ai/meta-llama/Llama-3.3-70B-Instruct-Turbo"]
 
 _log_lock = asyncio.Lock()
 
@@ -95,7 +93,9 @@ class Router:
         cache: PromptCache | None = None,
         log_path: Path | None = None,
         verifier_enabled: bool = True,
+        catalog: Catalog | None = None,
     ) -> None:
+        self._catalog = catalog or get_catalog()
         self._classifier = classifier or get_classifier(settings.classifier)
         self._verifier = verifier or CascadeVerifier()
         self._cache = cache if cache is not None else get_cache(
@@ -104,6 +104,15 @@ class Router:
         )
         self._log_path = log_path
         self._verifier_enabled = verifier_enabled
+
+        # Ordered candidate lists per tier. Today each tier holds one model, but the
+        # sequence shape preserves the "try every candidate in a tier before
+        # escalating" rule, and is what layer 2 will fan sub-tasks across.
+        self._cheap_sequence = self._tier_sequence("cheap")
+        self._frontier_sequence = self._tier_sequence("frontier")
+
+    def _tier_sequence(self, role: str) -> list[ModelSpec]:
+        return [m for m in self._catalog.all() if m.role == role]
 
     async def route_async(
         self,
@@ -196,10 +205,13 @@ class Router:
         """Try cheap models in sequence. Falls through to frontier if all fail."""
         last_error: Exception | None = None
 
-        for model in _CHEAP_SEQUENCE:
+        for spec in self._cheap_sequence:
+            model = spec.id
             decision.cascade_path.append(model)
             try:
-                resp = await call_model(model, messages, timeout_s=settings.model_timeout_s)
+                resp = await call_model(
+                    model, messages, timeout_s=settings.model_timeout_s, spec=spec
+                )
             except ProviderError as e:
                 logger.warning("Cheap model %s failed: %s — trying next", model, e)
                 last_error = e
@@ -262,11 +274,14 @@ class Router:
         """Try frontier models in sequence. Raises ProviderError if all fail."""
         last_error: Exception | None = None
 
-        for model in _FRONTIER_SEQUENCE:
+        for spec in self._frontier_sequence:
+            model = spec.id
             if model not in decision.cascade_path:
                 decision.cascade_path.append(model)
             try:
-                resp = await call_model(model, messages, timeout_s=settings.model_timeout_s)
+                resp = await call_model(
+                    model, messages, timeout_s=settings.model_timeout_s, spec=spec
+                )
             except ProviderError as e:
                 logger.warning("Frontier model %s failed: %s — trying next", model, e)
                 last_error = e
