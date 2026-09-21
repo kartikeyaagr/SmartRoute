@@ -40,4 +40,4 @@ decision:
   # ($1 -> $2 -> $5 per M input, vs $0.05 -> $0.15 -> $0.60), so the saving from a
   # correct lookup divert is larger and layer 1 can afford to fire more often at the
   # same lambda.
-  lambda_wrong_answer_usd: 0.001
+  lambda_wrong_answer_usd: 0.01
