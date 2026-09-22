@@ -151,3 +151,35 @@ def test_auth_accepts_correct_token(monkeypatch):
                 json={"messages": [{"role": "user", "content": "test"}]},
             )
     assert r.status_code == 200
+
+
+def test_meta_header_carries_decision_fields():
+    """The X-SmartRoute-Meta contract must expose why a request went where it did."""
+    import json
+
+    from smartroute.server import app
+
+    decision = _make_decision(
+        difficulty_tier="CHEAP",
+        route_path="cheap",
+        gate_reason="lookup p=0.99 >= 0.85",
+        projected_cost_usd=0.000066,
+        p_lookup=0.99,
+        subtask_count=0,
+    )
+    with TestClient(app) as client:
+        with patch.object(
+            client.app.state.router, "route_async",
+            new=AsyncMock(return_value=("Paris", decision)),
+        ):
+            response = client.post(
+                "/v1/chat/completions",
+                json={"messages": [{"role": "user", "content": "hi"}]},
+            )
+
+    assert response.status_code == 200
+    meta = json.loads(response.headers["X-SmartRoute-Meta"])
+    assert meta["route_path"] == "cheap"
+    assert "lookup" in meta["gate_reason"]
+    assert meta["projected_cost_usd"] > 0
+    assert meta["subtask_count"] == 0

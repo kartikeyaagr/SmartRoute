@@ -6,8 +6,8 @@ Tiers:
   MEDIUM → cheap → verifier ≥4 → return cheap; <4 → frontier
   HARD  → frontier directly
 
-Cheap sequence:  groq/llama-3.1-8b-instant
-Frontier sequence: groq/llama-3.3-70b-versatile
+Which concrete models back "cheap" and "frontier" comes from the catalog
+(models.yaml), not from this module. Swapping providers is a catalog edit.
 """
 
 import asyncio
@@ -20,15 +20,19 @@ from dataclasses import dataclass, field, asdict
 from pathlib import Path
 
 from smartroute.cache import NoOpCache, PromptCache, get_cache
+from typing import TYPE_CHECKING
+
+from smartroute.catalog import Catalog, ModelSpec, get_catalog
 from smartroute.classifier import DifficultyClassifier, DifficultyTier, get_classifier
 from smartroute.config import settings
 from smartroute.providers import ProviderError, call_model
 from smartroute.verifier import CascadeVerifier
 
-logger = logging.getLogger(__name__)
+if TYPE_CHECKING:
+    from smartroute.decision import DecisionLayer
+    from smartroute.decomposer import Decomposer
 
-_CHEAP_SEQUENCE = ["groq/llama-3.1-8b-instant"]
-_FRONTIER_SEQUENCE = ["groq/llama-3.3-70b-versatile"]
+logger = logging.getLogger(__name__)
 
 _log_lock = asyncio.Lock()
 
@@ -54,6 +58,14 @@ class RoutingDecision:
     cache_hit: bool = False
     cache_similarity: float | None = None  # 1.0 for exact-match; future use for pgvector
     error: str | None = None
+
+    # Two-layer decision fields (dispatch="decision")
+    route_path: str = ""                   # "cheap" | "middle" | "frontier" | "decompose"
+    gate_reason: str = ""                  # why the decision layer chose that path
+    p_lookup: float | None = None
+    p_decompose: float | None = None
+    projected_cost_usd: float = 0.0
+    subtask_count: int = 0
 
 
 def _hash_prompt(messages: list[dict]) -> str:
@@ -95,7 +107,17 @@ class Router:
         cache: PromptCache | None = None,
         log_path: Path | None = None,
         verifier_enabled: bool = True,
+        catalog: Catalog | None = None,
+        dispatch: str = "decision",
+        decision_layer: "DecisionLayer | None" = None,
+        decomposer: "Decomposer | None" = None,
     ) -> None:
+        if dispatch not in ("decision", "cascade"):
+            raise ValueError(f"dispatch must be 'decision' or 'cascade', got {dispatch!r}")
+        self._dispatch_mode = dispatch
+        self._decision_layer = decision_layer
+        self._decomposer = decomposer
+        self._catalog = catalog or get_catalog()
         self._classifier = classifier or get_classifier(settings.classifier)
         self._verifier = verifier or CascadeVerifier()
         self._cache = cache if cache is not None else get_cache(
@@ -105,10 +127,37 @@ class Router:
         self._log_path = log_path
         self._verifier_enabled = verifier_enabled
 
+        # Ordered candidate lists per tier. Today each tier holds one model, but the
+        # sequence shape preserves the "try every candidate in a tier before
+        # escalating" rule, and is what layer 2 will fan sub-tasks across.
+        self._cheap_sequence = self._tier_sequence("cheap")
+        self._frontier_sequence = self._tier_sequence("frontier")
+
+    def _tier_sequence(self, role: str) -> list[ModelSpec]:
+        return [m for m in self._catalog.all() if m.role == role]
+
+    @property
+    def decision_layer(self) -> "DecisionLayer":
+        """Lazily built so cascade-mode routers never load the embedding model."""
+        if self._decision_layer is None:
+            from smartroute.decision import DecisionLayer
+
+            self._decision_layer = DecisionLayer(catalog=self._catalog)
+        return self._decision_layer
+
+    @property
+    def decomposer(self) -> "Decomposer":
+        if self._decomposer is None:
+            from smartroute.decomposer import Decomposer
+
+            self._decomposer = Decomposer(catalog=self._catalog)
+        return self._decomposer
+
     async def route_async(
         self,
         messages: list[dict],
         request_id: str | None = None,
+        **params,
     ) -> tuple[str, RoutingDecision]:
         """
         Route messages to the appropriate model.
@@ -143,6 +192,9 @@ class Router:
                 await _append_decision(self._log_path, decision)
             return hit.response, decision
 
+        if self._dispatch_mode == "decision":
+            return await self._route_by_decision(messages, prompt_text, rid, t0, params)
+
         tier, score = self._classifier.classify(messages)
 
         decision = RoutingDecision(
@@ -172,6 +224,81 @@ class Router:
 
         return content, decision
 
+    async def _route_by_decision(
+        self,
+        messages: list[dict],
+        prompt_text: str,
+        rid: str,
+        t0: float,
+        params: dict | None = None,
+    ) -> tuple[str, RoutingDecision]:
+        """
+        Two-layer dispatch: triage -> gate -> (cheap | middle | frontier | decompose).
+
+        The frontier tier is never a default destination here; it is reached only when
+        the gate's arithmetic prefers it to splitting, or via the decomposer's bail-out.
+        """
+        route = self.decision_layer.decide(prompt_text)
+
+        decision = RoutingDecision(
+            request_id=rid,
+            prompt_hash=_hash_prompt(messages),
+            # Kept populated so the Postgres schema, Prometheus labels and the
+            # X-SmartRoute-Meta header contract keep working unchanged.
+            difficulty_tier=route.path.upper(),
+            difficulty_score=max(route.signals.p_lookup, route.signals.p_decompose),
+            classifier_backend=route.signals.backend,
+            route_path=route.path,
+            gate_reason=route.reason,
+            p_lookup=route.signals.p_lookup,
+            p_decompose=route.signals.p_decompose,
+            projected_cost_usd=route.projected_cost_usd,
+        )
+
+        try:
+            if route.path == "decompose":
+                result = await self.decomposer.run(prompt_text, messages)
+                content = result.content
+                decision.cascade_path = result.models_used
+                decision.final_model = result.models_used[-1] if result.models_used else ""
+                decision.input_tokens = result.input_tokens
+                decision.output_tokens = result.output_tokens
+                decision.estimated_cost_usd = result.cost_usd
+                decision.subtask_count = len(result.subtasks)
+                decision.gate_reason = f"{route.reason} | layer2: {result.reason}"
+                decision.escalated = result.route == "bailout-frontier"
+            else:
+                content = await self._call_tier(route.path, messages, decision, params or {})
+        except Exception as exc:
+            decision.error = str(exc)
+            decision.latency_ms = (time.perf_counter() - t0) * 1000
+            if self._log_path:
+                await _append_decision(self._log_path, decision)
+            raise
+
+        decision.latency_ms = (time.perf_counter() - t0) * 1000
+        await self._cache.put(prompt_text, content)
+        if self._log_path:
+            await _append_decision(self._log_path, decision)
+        return content, decision
+
+    async def _call_tier(
+        self, role: str, messages: list[dict], decision: RoutingDecision,
+        params: dict | None = None,
+    ) -> str:
+        """Single call to a named catalog tier."""
+        spec = self._catalog.by_role(role)
+        decision.cascade_path.append(spec.id)
+        resp = await call_model(
+            spec.id, messages, timeout_s=settings.model_timeout_s, spec=spec,
+            **(params or {})
+        )
+        decision.final_model = spec.id
+        decision.input_tokens += resp.input_tokens
+        decision.output_tokens += resp.output_tokens
+        decision.estimated_cost_usd += resp.estimated_cost_usd
+        return resp.content
+
     async def _dispatch(
         self,
         messages: list[dict],
@@ -196,10 +323,13 @@ class Router:
         """Try cheap models in sequence. Falls through to frontier if all fail."""
         last_error: Exception | None = None
 
-        for model in _CHEAP_SEQUENCE:
+        for spec in self._cheap_sequence:
+            model = spec.id
             decision.cascade_path.append(model)
             try:
-                resp = await call_model(model, messages, timeout_s=settings.model_timeout_s)
+                resp = await call_model(
+                    model, messages, timeout_s=settings.model_timeout_s, spec=spec
+                )
             except ProviderError as e:
                 logger.warning("Cheap model %s failed: %s — trying next", model, e)
                 last_error = e
@@ -262,11 +392,14 @@ class Router:
         """Try frontier models in sequence. Raises ProviderError if all fail."""
         last_error: Exception | None = None
 
-        for model in _FRONTIER_SEQUENCE:
+        for spec in self._frontier_sequence:
+            model = spec.id
             if model not in decision.cascade_path:
                 decision.cascade_path.append(model)
             try:
-                resp = await call_model(model, messages, timeout_s=settings.model_timeout_s)
+                resp = await call_model(
+                    model, messages, timeout_s=settings.model_timeout_s, spec=spec
+                )
             except ProviderError as e:
                 logger.warning("Frontier model %s failed: %s — trying next", model, e)
                 last_error = e
