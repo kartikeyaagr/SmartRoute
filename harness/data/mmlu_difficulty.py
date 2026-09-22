@@ -1,9 +1,9 @@
 """
 Load 500 MMLU prompts from HuggingFace, map categories to difficulty tiers,
-save to bench/data/mmlu_500.jsonl.
+save to harness/data/mmlu_500.jsonl.
 
 Usage:
-    uv run bench/data/mmlu_difficulty.py
+    uv run harness/data/mmlu_difficulty.py
 """
 
 import json
