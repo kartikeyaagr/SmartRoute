@@ -1,127 +1,220 @@
 # SmartRoute
 
-### An inference router that sends every request to the cheapest model that can actually handle it.
+An LLM inference router that sends each request to the cheapest model that can handle it — and the benchmark harness that tells you whether routing is worth doing at all.
 
-**One endpoint. Every provider. The frontier model only when it earns its place.**
+The router is real and works. The harness is the reason this repo exists: run it against your own traffic before you believe anyone's cost-savings claim, including this one.
 
-SmartRoute triages each request, answers the obvious lookups with the cheapest model,
-defaults everything else to a capable mid-tier model, and splits genuinely multi-part
-work into sub-tasks that are individually routed — but only when the arithmetic says
-splitting is cheaper than just asking a frontier model.
+---
 
-```
-prompt
-  ├─ LAYER 1  confident "google-substitute" lookup?  ──→  CHEAP
-  ├─ GATE     sub-tasks needed AND worth paying for? ──→  MIDDLE   ← the default
-  └─ LAYER 2  decompose, route each sub-task         ──→  cheap | middle | frontier
-                                                          then synthesise
-```
+## The headline finding
 
-The frontier tier is never a default destination. It is reached only when the gate's
-cost arithmetic prefers it, or via layer 2's bail-out.
+On 200 questions written to resemble everyday assistant traffic, against a Claude
+ladder of Haiku 4.5 → Sonnet 5 → Opus 5:
 
-## Why it is built this way
+| arm | $/query | accuracy | |
+|---|---|---|---|
+| **always-cheap** | **$0.001206** | **100.0%** | ← winner |
+| routed | $0.004949 | 100.0% | 4.1× the cost |
+| always-middle | $0.004981 | 100.0% | 4.1× the cost |
+| always-frontier | $0.014174 | 100.0% | 11.8× the cost |
 
-Every design choice below came out of measuring the previous one, not from a hunch.
+All four arms scored identically. Across 199 completed queries, the cheap and middle
+tiers **disagreed on zero of them**. With no quality signal to route on, routing is
+pure added cost.
 
-**The regex classifier could not classify.** Run over all 500 rows of its own MMLU set,
-the original keyword classifier sent **92.8%** of prompts to MEDIUM (the dataset's own
-labels say 43%). Reordering the patterns does not help — `EASY` patterns are anchored
-`.match()` on openers like "what is", and real prompts are declarative stems, so nothing
-matches either way.
+That is not a bug in the router — layer 1 works, diverting 49 of 50 lookups to the
+cheap tier at 1.03× the cost of always-cheap on that category. It is a finding about
+the traffic: everyday assistant questions sit inside the cheapest model's competence,
+so there is nothing to escalate for.
 
-**Worse, it could not see a hidden hop.** These two open identically:
+**Routing pays only when some traffic actually fails at the cheap tier.** If yours
+does, this harness will show you; if it doesn't, it will save you from shipping a 4×
+bill for nothing. [Full benchmark documentation →](BENCHMARK.md)
 
-```
-lookup   "In what year was Harvard founded?"
-2-hop    "In what year was the university where Tokarev was a professor founded?"
-```
+---
 
-so **41.6%** of HotpotQA's multi-hop questions were being routed to the *cheapest* model.
+## Quickstart
 
-**Routing accuracy, measured offline over 1500 rows** (`harness/eval_routing.py --compare`):
-
-|                             | regex heuristic | learned heads |
-|-----------------------------|-----------------|---------------|
-| MMLU → middle               | 86.6%           | **100.0%**    |
-| HotpotQA → decompose        | 10.2%           | **53.4%**     |
-| overall                     | 47.6%           | 56.4%         |
-| **multi-hop sent to CHEAP** | **41.6%**       | **1.0%**      |
-
-TriviaQA recall is deliberately low. Layer 1 only fires when its *measured* precision
-clears the bar the catalog economics set — diverting a lookup saves $0.000133, so at
-λ=$0.001 the head needs 88.3% precision. Leaving savings on the table is the correct
-side of an asymmetric loss: a missed lookup costs a fraction of a cent, a false one
-returns a bad answer.
-
-## Thresholds are derived, not guessed
-
-Breaking even on a lookup divert requires `precision = λ / (saving + λ)`:
-
-| λ (your cost of a wrong answer) | required precision |
-|---|---|
-| $0.0005 | 79.0% |
-| $0.0010 | 88.3% |
-| $0.0100 | 98.7% |
-
-The trainer persists a measured precision/recall curve; the decision layer picks the
-lowest threshold that clears the bar — and **disables layer 1 entirely** if no threshold
-reaches it. One knob, `lambda_wrong_answer_usd`, in `models.yaml`.
-
-The same logic gates layer 2. Decompose + synthesise costs ~2.4× a direct middle answer
-before a single sub-task runs, so splitting only pays when it replaces frontier work
-*and* the sub-tasks stay cheap:
-
-| sub-task mix | vs one frontier call | |
-|---|---|---|
-| 3 × cheap | 0.52× | **pays** |
-| 2 × cheap + 1 × middle | 0.59× | **pays** |
-| 1 each | 1.21× | loses |
-
-A hard dollar guard runs before any quality weighting: if a plan's projected spend
-already exceeds one frontier call, the plan is discarded and that call is made instead.
-
-## Model-agnostic by construction
-
-Every model, price, and tier lives in `models.yaml`. Swapping providers is a config
-edit — there is a test that asserts it:
-
-```yaml
-models:
-  - {alias: cheap,    id: together_ai/openai/gpt-oss-20b,      role: cheap}
-  - {alias: middle,   id: together_ai/openai/gpt-oss-120b,     role: middle}
-  - {alias: frontier, id: together_ai/Qwen/Qwen3.5-397B-A17B,  role: frontier}
-routing:
-  tiers: [cheap, middle, frontier]
-  default_tier: middle
-```
-
-Prices resolve from LiteLLM's registry (4326 models) with a YAML override, and an
-unpriced model **raises** rather than silently costing $0.00. The catalog also refuses
-to load a judge from the same model family as the tier it grades, and a tier ladder
-that does not ascend in price.
-
-## Getting started
+Requires Python 3.13+ and [uv](https://docs.astral.sh/uv/).
 
 ```bash
+git clone <repo> && cd SmartRoute
 uv sync --extra server --extra ml --extra bench --group dev
-cp .env.example .env            # add your provider key
+cp .env.example .env          # add one provider key
 
-uv run pytest                                          # 207 tests
-uv run --extra bench harness/build_corpora.py          # one-time: fetch eval corpora
-uv run --extra ml    harness/train_triage.py           # fit the triage heads
-uv run --extra ml    harness/eval_routing.py --compare # measure routing, offline, $0
-uv run smartroute-server                               # OpenAI-compatible API
+uv run pytest                 # 217 tests, no network
+```
+
+Route a request as a library:
+
+```python
+from smartroute import Router
+
+router = Router()                                  # reads models.yaml
+answer, decision = router.route(
+    [{"role": "user", "content": "What's the capital of Australia?"}]
+)
+
+print(answer)                   # "Canberra."
+print(decision.route_path)      # "cheap"
+print(decision.gate_reason)     # "lookup p=0.76 >= 0.5"
+print(decision.estimated_cost_usd)
+```
+
+Or run it as an OpenAI-compatible server and change one `base_url`:
+
+```bash
+uv run smartroute-server        # POST /v1/chat/completions on :8000
 ```
 
 Routing metadata comes back in the `X-SmartRoute-Meta` response header — path taken,
 why, projected cost, sub-task count — so the response body stays 100% OpenAI-compatible.
 
-## Status
+Measure it on your own traffic:
 
-The routing layer is built and measured. Still open: the cascade verifier is disabled
-by default pending rework — the previous judge (Qwen2.5-72B at $1.20/M) cost **1.44×
-the frontier call it existed to avoid**, at every output length, so it could never pay
-for itself. End-to-end cost numbers await a live run.
+```bash
+uv run --extra ml harness/eval_routing.py --compare          # routing accuracy, offline, $0
+uv run --extra ml harness/run_routing.py --n 200 --arm all   # live cost/accuracy, all arms
+```
 
-Reach out at kartikay3@outlook.com if you want early access.
+---
+
+## How routing works
+
+![Classifier flow with measured probabilities](diagrams/smartroute-classifier.png)
+
+Three decisions, each cheap enough to run on every request:
+
+**Layer 1 — triage.** A logistic-regression head over a frozen MiniLM embedding
+estimates `p_lookup`: is this the kind of question someone would have typed into a
+search box? The encoder is the one `cache.py` already loads for the pgvector semantic
+cache, so on a cache-enabled deployment the prompt is embedded once and used twice.
+
+**The gate.** A second head estimates `p_decompose`. Below the threshold the request
+goes to the middle tier — the default. The frontier tier is never a default
+destination; it is reached only when the gate's cost arithmetic prefers it, or via
+layer 2's bail-out.
+
+**Layer 2 — decomposition.** The middle model splits the request into sub-tasks,
+each routed independently, then synthesises. Guarded by a hard dollar check: if the
+projected split cost already exceeds one frontier call, the plan is discarded and that
+call is made instead.
+
+### Thresholds are derived, not guessed
+
+Diverting a lookup saves `(middle − cheap)` when right and costs `λ` when wrong, so
+breaking even requires:
+
+```
+precision = λ / (saving + λ)
+```
+
+`λ` — what a wrong answer costs you, in dollars — is the single operator knob, set in
+`models.yaml`. The trainer persists a measured precision/recall curve; the decision
+layer picks the lowest threshold clearing the bar, and **disables layer 1 entirely**
+if no threshold reaches it.
+
+This matters more than it sounds. On the Together AI ladder the required precision is
+88.3% at λ=$0.001; on the wider-spread Claude ladder the same λ demands only 38.1%,
+which drops the threshold to 0.50 and sends 39% of multi-hop work to the weakest model.
+Same formula, same λ, opposite behaviour — because the economics changed underneath it.
+Set `λ` to what a wrong answer actually costs you.
+
+---
+
+## Model-agnostic by construction
+
+Every model, price, and tier lives in `models.yaml`. Swapping providers is a config
+edit, and there is a test asserting exactly that.
+
+```yaml
+models:
+  - {alias: cheap,    id: claude-haiku-4-5-20251001, role: cheap,    env_key: ANTHROPIC_API_KEY}
+  - {alias: middle,   id: claude-sonnet-5,           role: middle,   env_key: ANTHROPIC_API_KEY}
+  - {alias: frontier, id: claude-opus-5,             role: frontier, env_key: ANTHROPIC_API_KEY}
+routing:
+  tiers: [cheap, middle, frontier]
+  default_tier: middle
+decision:
+  lambda_wrong_answer_usd: 0.01
+```
+
+The catalog refuses to load a configuration it cannot reason about:
+
+| guard | why |
+|---|---|
+| unpriced model → `UnpricedModelError` | silently recording $0.00 corrupts the only number the project reports |
+| tier ladder must ascend in price | "escalate" is meaningless otherwise |
+| judge must differ in model family from the tier it grades | otherwise it grades its own homework |
+| `unsupported_params` per model | Sonnet 5 and Opus 5 reject `temperature` with a hard 400; Haiku accepts it |
+
+Prices resolve from LiteLLM's registry (4,326 models) with a YAML override. Shipped
+catalogs: `models.yaml` (Together AI), `models.anthropic.yaml`, `models.groq.yaml`.
+
+---
+
+## What's in the box
+
+```
+src/smartroute/
+  catalog.py      models.yaml → ModelSpec, prices, validation guards
+  decision.py     layer 1 triage, the gate, expected-cost rule
+  decomposer.py   layer 2: split, route sub-tasks, synthesise, bail out
+  router.py       orchestration, cache, decision logging
+  providers.py    provider seam; catalog is the pricing authority
+  server.py       OpenAI-compatible FastAPI app
+  cache.py        NoOp / in-memory LRU / pgvector semantic cache
+  db.py           Postgres decision log with migrations
+  observability.py  Prometheus metrics, JSON logs, OTel traces
+
+harness/
+  corpora.py        dataset protocol + the 200-question corpus + graders
+  data/synthetic_corpus.py   the corpus source, with assertions
+  train_triage.py   fit the two heads, persist the calibration curve
+  eval_routing.py   routing accuracy, offline, $0
+  run_routing.py    live cost/accuracy across arms
+```
+
+217 tests, no network required.
+
+---
+
+## Status and honest limits
+
+The router, catalog, harness, server, cache, and observability are built and tested.
+What you should know before trusting any of it:
+
+- **The corpus is saturated.** Every tier answers it correctly, so it cannot
+  discriminate between them. A useful routing benchmark needs questions the cheap tier
+  demonstrably fails.
+- **Grading measures term presence, not answer quality.** It rejects wrong, vague, and
+  evasive answers (verified 7/7 adversarially) but cannot distinguish "correct but
+  shallow" from "correct and excellent". A premium tier cannot demonstrate value under
+  this metric even if it deserves one.
+- **The decompose head does not work.** Precision 0.18 — 30 positives split for
+  training is far too few. Multi-part requests route to the middle tier.
+- **Layer 2 has never executed.** On a 5× cheap→frontier spread, decompose plus
+  synthesis costs more than a single frontier call, so the dollar guard suppresses it
+  every time. Decomposition needs a wide ladder to be viable.
+- **The cascade verifier is disabled.** The previous judge (Qwen2.5-72B, $1.20/M) cost
+  1.44× the frontier call it existed to avoid, at every output length. Replacing it
+  with free logprob signals is unstarted.
+
+---
+
+## Contributing
+
+The most useful contribution is a corpus that defeats the cheap tier. See
+[BENCHMARK.md](BENCHMARK.md#adding-your-own-corpus) — a corpus is a JSONL file plus a
+grader, and dataset membership supplies the routing labels.
+
+```bash
+uv run pytest                    # must stay green
+uv run --extra ml harness/eval_routing.py --compare   # routing didn't regress
+```
+
+## License
+
+Not yet licensed. Contact kartikay3@outlook.com.
+
+*Last reviewed: 2026-09-22.*
