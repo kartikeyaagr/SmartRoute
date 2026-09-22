@@ -46,8 +46,10 @@ nothing. Start here.
 uv run --extra ml harness/eval_routing.py --compare
 ```
 
-Reports, per corpus, where each question was routed against where it should have gone,
-for both the learned heads and the regex fallback.
+Reports, grouped by where each question *should* have gone, where it actually went —
+for both the learned heads and the regex fallback, so you can see what the training
+bought. Watch the SAFETY block: it counts work that needed more than the cheapest
+model and was sent there anyway.
 
 ### Cost and accuracy, live
 
@@ -105,6 +107,10 @@ This is not academic tidiness. Heads trained on those three caught **7 of 50** l
 and **0 of 30** multi-part questions when tested on natural phrasing. They had learned
 the corpora's surface form, not the underlying distinction, and every routing number
 derived from them was measuring the wrong thing.
+
+Their loaders and data files were removed once that was established. The one table
+below that still cites them is sourced from the retained run summary in
+`harness/results/`, not from code you can re-run.
 
 ### Grading
 

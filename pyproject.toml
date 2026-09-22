@@ -22,10 +22,6 @@ ml = [
     "scikit-learn>=1.5",
     "joblib>=1.4",
 ]
-# uv sync --extra bench — MMLU benchmark harness
-bench = [
-    "datasets>=2.19",
-]
 # uv sync --extra server — FastAPI API server (server.py)
 # Server deps are optional: the library works without them.
 server = [
