@@ -197,7 +197,7 @@ class Catalog:
         Env vars that the given models need but which are not set.
 
         Deriving this from the catalog is what stops preflight from drifting: today
-        bench/run_benchmark.py checks `openai_api_key` and reports `GROQ_API_KEY`.
+        harness/run_benchmark.py checks `openai_api_key` and reports `GROQ_API_KEY`.
         """
         import os
 
