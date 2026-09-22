@@ -115,7 +115,7 @@ def contains_answer(prediction: str, golds: list[str]) -> bool:
 def _read_jsonl(path: Path) -> list[dict]:
     if not path.exists():
         raise FileNotFoundError(
-            f"{path} not found. Build it first:  uv run harness/build_corpora.py"
+            f"{path} not found. Generate it:  uv run harness/data/synthetic_corpus.py"
         )
     with path.open() as f:
         return [json.loads(line) for line in f if line.strip()]
@@ -130,129 +130,6 @@ def _sample(rows: list, n: int | None, seed: int) -> list:
 # ---------------------------------------------------------------------------
 # Datasets
 # ---------------------------------------------------------------------------
-
-class MMLUDataset:
-    """Single-step, knowledge-heavy, 4-way multiple choice. Should route to MIDDLE."""
-
-    name = "mmlu"
-    expected_path = ATOMIC
-    VALID_ANSWERS = frozenset("ABCD")
-
-    def __init__(self, path: Path | None = None) -> None:
-        self._path = path or DATA_DIR / "mmlu_500.jsonl"
-
-    def load(self, n: int | None = None, seed: int = 42) -> list[Example]:
-        rows = _sample(_read_jsonl(self._path), n, seed)
-        return [
-            Example(
-                source_id=r["source_id"],
-                prompt=r["prompt"],
-                answer=r["correct_answer"],
-                dataset=self.name,
-                expected_path=self.expected_path,
-                metadata={"subject": r.get("subject"), "label_tier": r.get("difficulty_tier")},
-            )
-            for r in rows
-        ]
-
-    def system_prompt(self) -> str:
-        return "Respond with ONLY the letter A, B, C, or D on the first line."
-
-    def grade(self, example: Example, response: str) -> tuple[bool, bool]:
-        extracted, failed = self.extract_letter(response)
-        return (extracted == example.answer and not failed), failed
-
-    @staticmethod
-    def extract_letter(response: str) -> tuple[str, bool]:
-        """Extract A/B/C/D from the first line. Returns (letter, extraction_failed)."""
-        first_line = response.strip().split("\n")[0].strip().upper()
-        for token in first_line.split():
-            clean = token.strip("().:,*")
-            if clean in MMLUDataset.VALID_ANSWERS:
-                return clean, False
-        return (first_line[:1] if first_line else ""), True
-
-
-class TriviaQADataset:
-    """
-    The google-substitute tier: short single-hop factual lookups.
-
-    This is the traffic layer 1 should divert to the cheapest model — questions
-    someone asks instead of typing them into a search box.
-    """
-
-    name = "triviaqa"
-    expected_path = LOOKUP
-
-    def __init__(self, path: Path | None = None) -> None:
-        self._path = path or DATA_DIR / "triviaqa_500.jsonl"
-
-    def load(self, n: int | None = None, seed: int = 42) -> list[Example]:
-        rows = _sample(_read_jsonl(self._path), n, seed)
-        return [
-            Example(
-                source_id=r["source_id"],
-                prompt=r["prompt"],
-                answer=r["answer"],
-                aliases=tuple(r.get("aliases") or ()),
-                dataset=self.name,
-                expected_path=self.expected_path,
-            )
-            for r in rows
-        ]
-
-    def system_prompt(self) -> str:
-        return "Answer with just the fact, as briefly as possible. No explanation."
-
-    def grade(self, example: Example, response: str) -> tuple[bool, bool]:
-        golds = [example.answer, *example.aliases]
-        if not response.strip():
-            return False, True
-        return (exact_match(response, golds) or contains_answer(response, golds)), False
-
-
-class HotpotQADataset:
-    """
-    Multi-hop questions that genuinely need two or more facts combined.
-
-    This is the only dataset here that can exercise layer 2 — the decomposition
-    path — because it is the only one whose items have more than one part.
-    """
-
-    name = "hotpotqa"
-    expected_path = DECOMPOSE
-
-    def __init__(self, path: Path | None = None) -> None:
-        self._path = path or DATA_DIR / "hotpotqa_500.jsonl"
-
-    def load(self, n: int | None = None, seed: int = 42) -> list[Example]:
-        rows = _sample(_read_jsonl(self._path), n, seed)
-        return [
-            Example(
-                source_id=r["source_id"],
-                prompt=r["prompt"],
-                answer=r["answer"],
-                dataset=self.name,
-                expected_path=self.expected_path,
-                metadata={"type": r.get("type"), "level": r.get("level")},
-            )
-            for r in rows
-        ]
-
-    def system_prompt(self) -> str:
-        return "Answer with just the fact, as briefly as possible. No explanation."
-
-    def grade(self, example: Example, response: str) -> tuple[bool, bool]:
-        golds = [example.answer]
-        if not response.strip():
-            return False, True
-        if exact_match(response, golds) or contains_answer(response, golds):
-            return True, False
-        # yes/no comparison items must match exactly; partial credit would inflate them
-        if example.answer.lower() in ("yes", "no"):
-            return False, False
-        return token_f1(response, example.answer) >= 0.6, False
-
 
 class SyntheticDataset:
     """
@@ -316,12 +193,8 @@ class SyntheticDataset:
 
 DATASETS: dict[str, type] = {
     SyntheticDataset.name: SyntheticDataset,
-    MMLUDataset.name: MMLUDataset,
-    TriviaQADataset.name: TriviaQADataset,
-    HotpotQADataset.name: HotpotQADataset,
 }
 
-# The academic sets are kept for comparison but are no longer the default benchmark.
 DEFAULT_DATASETS = [SyntheticDataset.name]
 
 

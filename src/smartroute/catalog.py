@@ -196,8 +196,10 @@ class Catalog:
         """
         Env vars that the given models need but which are not set.
 
-        Deriving this from the catalog is what stops preflight from drifting: today
-        harness/run_benchmark.py checks `openai_api_key` and reports `GROQ_API_KEY`.
+        Deriving this from the catalog is what stops preflight from drifting. The
+        benchmark runner this replaced hand-matched provider prefixes to settings
+        fields, and had drifted far enough to test `openai_api_key` while reporting
+        `GROQ_API_KEY` missing.
         """
         import os
 

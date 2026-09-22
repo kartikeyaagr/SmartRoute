@@ -33,7 +33,7 @@ import sys
 from pathlib import Path
 
 # Running `python harness/train_triage.py` puts harness/ on sys.path, not the repo
-# root, so `import harness.corpora` would fail. Match run_benchmark.py's approach.
+# root, so `import harness.corpora` would fail.
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO_ROOT))
 sys.path.insert(0, str(_REPO_ROOT / "src"))
@@ -57,7 +57,7 @@ def load_labelled(corpora: list[str]) -> tuple[list[str], list[int], list[int], 
         try:
             examples = dataset.load()
         except FileNotFoundError as exc:
-            raise SystemExit(f"{exc}\nBuild the corpora first: uv run --extra bench harness/build_corpora.py")
+            raise SystemExit(f"{exc}\nGenerate the corpus first: uv run harness/data/synthetic_corpus.py")
         for ex in examples:
             prompts.append(ex.prompt)
             lookup.append(int(ex.expected_path == "cheap"))

@@ -39,10 +39,10 @@ Requires Python 3.13+ and [uv](https://docs.astral.sh/uv/).
 
 ```bash
 git clone <repo> && cd SmartRoute
-uv sync --extra server --extra ml --extra bench --group dev
+uv sync --extra server --extra ml --group dev
 cp .env.example .env          # add one provider key
 
-uv run pytest                 # 217 tests, no network
+uv run pytest                 # 202 tests, no network
 ```
 
 Route a request as a library:
@@ -175,7 +175,7 @@ harness/
   run_routing.py    live cost/accuracy across arms
 ```
 
-217 tests, no network required.
+202 tests, no network required.
 
 ---
 

@@ -6,13 +6,11 @@ import pytest
 
 from harness.corpora import (
     ATOMIC,
+    DATASETS,
     DECOMPOSE,
     LOOKUP,
-    DATASETS,
     Example,
-    HotpotQADataset,
-    MMLUDataset,
-    TriviaQADataset,
+    SyntheticDataset,
     contains_answer,
     exact_match,
     get_dataset,
@@ -62,95 +60,22 @@ class TestGraders:
         assert token_f1("completely different", "Barack Obama") == 0.0
 
 
-class TestMMLU:
-    @pytest.mark.parametrize(
-        "response,letter,failed",
-        [
-            ("B", "B", False),
-            ("B. Because the rate is...", "B", False),
-            ("(C)", "C", False),
-            ("The answer is D", "D", False),
-            ("I am not certain about this", "I", True),
-            ("", "", True),
-        ],
-    )
-    def test_extract_letter(self, response, letter, failed):
-        assert MMLUDataset.extract_letter(response) == (letter, failed)
-
-    def test_grades_against_gold_letter(self):
-        ds = MMLUDataset()
-        ex = Example("x", "q", "B", "mmlu", ATOMIC)
-        assert ds.grade(ex, "B. because") == (True, False)
-        assert ds.grade(ex, "A") == (False, False)
-
-    def test_extraction_failure_is_not_correct(self):
-        ds = MMLUDataset()
-        ex = Example("x", "q", "B", "mmlu", ATOMIC)
-        correct, failed = ds.grade(ex, "I cannot answer that")
-        assert failed and not correct
-
-    def test_loads_real_corpus_with_atomic_label(self):
-        examples = MMLUDataset().load(n=25, seed=1)
-        assert len(examples) == 25
-        assert all(e.expected_path == ATOMIC for e in examples)
-        assert all(e.answer in "ABCD" for e in examples)
-
-    def test_sampling_is_deterministic(self):
-        a = [e.source_id for e in MMLUDataset().load(n=20, seed=7)]
-        b = [e.source_id for e in MMLUDataset().load(n=20, seed=7)]
-        c = [e.source_id for e in MMLUDataset().load(n=20, seed=8)]
-        assert a == b and a != c
-
-
-class TestTriviaQAGrading:
-    def test_alias_counts_as_correct(self):
-        ds = TriviaQADataset()
-        ex = Example("x", "q", "David Seville", "triviaqa", LOOKUP, aliases=("Ross Bagdasarian",))
-        assert ds.grade(ex, "Ross Bagdasarian")[0]
-
-    def test_empty_response_is_extraction_failure(self):
-        ds = TriviaQADataset()
-        ex = Example("x", "q", "David Seville", "triviaqa", LOOKUP)
-        assert ds.grade(ex, "   ") == (False, True)
-
-
-class TestHotpotQAGrading:
-    def test_yes_no_requires_exact_match(self):
-        """Partial credit on yes/no comparison items would inflate accuracy."""
-        ds = HotpotQADataset()
-        ex = Example("x", "q", "yes", "hotpotqa", DECOMPOSE)
-        assert ds.grade(ex, "yes")[0]
-        assert not ds.grade(ex, "Actually the nationalities differ")[0]
-
-    def test_partial_credit_for_entity_answers(self):
-        ds = HotpotQADataset()
-        ex = Example("x", "q", "Barack Obama", "hotpotqa", DECOMPOSE)
-        assert ds.grade(ex, "Barack Hussein Obama")[0]
-
-
 class TestRegistry:
-    def test_academic_sets_cover_one_routing_destination_each(self):
-        """The academic sets label a whole dataset at once, one per destination."""
-        paths = {n: DATASETS[n].expected_path for n in ("mmlu", "triviaqa", "hotpotqa")}
-        assert paths == {"mmlu": ATOMIC, "triviaqa": LOOKUP, "hotpotqa": DECOMPOSE}
-        assert len(set(paths.values())) == 3
-
     def test_synthetic_is_the_default_and_labels_per_item(self):
         """
         The synthetic corpus carries all three destinations in one file, labelled per
         question — which is what lets one corpus both train and evaluate the router.
         """
-        from harness.corpora import DEFAULT_DATASETS, SyntheticDataset
+        from harness.corpora import DEFAULT_DATASETS
 
         assert DEFAULT_DATASETS == ["synthetic"]
+        assert list(DATASETS) == ["synthetic"]
         examples = SyntheticDataset().load()
         assert len(examples) == 200
         assert {e.expected_path for e in examples} == {LOOKUP, ATOMIC, DECOMPOSE}
 
     def test_synthetic_grading_rejects_wrong_and_evasive_answers(self):
         """Keyword grading is only useful if it actually says no."""
-        from harness.corpora import SyntheticDataset
-
         ds = SyntheticDataset()
         item = next(e for e in ds.load() if "capital of Australia" in e.prompt)
         assert ds.grade(item, "Canberra is the capital.")[0]
@@ -159,8 +84,6 @@ class TestRegistry:
 
     def test_synthetic_every_item_has_assertions(self):
         """An item with no assertions is unconditionally correct and inflates accuracy."""
-        from harness.corpora import SyntheticDataset
-
         assert all(e.metadata["must_include"] for e in SyntheticDataset().load())
 
     def test_get_dataset_rejects_unknown(self):
