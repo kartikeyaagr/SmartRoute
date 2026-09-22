@@ -1,0 +1,42 @@
+---
+title: "SmartRoute classifier - 199 queries, Claude ladder, measured 2026-09-21"
+---
+graph TD
+    Q["QUERY"]
+    E["EMBED<br/>all-MiniLM-L6-v2 - 384-dim<br/>local, ~free"]
+
+    L1{"LAYER 1 - TRIAGE<br/>p_lookup >= 0.50 ?<br/>threshold derived from<br/>catalog economics"}
+    GATE{"DECOMPOSITION GATE<br/>p_decompose >= 0.75 ?"}
+    GUARD{"COST GUARD<br/>projected split cost<br/>below one frontier call ?"}
+
+    CHEAP["CHEAP - claude-haiku-4-5<br/>avg $0.00026 / query<br/>accuracy 100%<br/><br/>'What's the largest ocean on Earth?'<br/>p_lookup 0.820 - p_dec 0.179"]
+    MID["MIDDLE - claude-sonnet-5<br/>THE DEFAULT<br/>avg $0.00641 / query<br/>accuracy 100%<br/><br/>'Explain the water cycle, then describe<br/>how climate change is altering it.'<br/>p_dec 0.743 - just under the bar"]
+    FRONT["FRONTIER - claude-opus-5<br/>avg $0.03289 / query<br/>accuracy 100%<br/><br/>'Explain how a bill becomes law, then<br/>describe two ways it can fail.'<br/>p_dec 0.757"]
+    L2["LAYER 2 - DECOMPOSE<br/>split, route each sub-task, synthesise<br/><br/>NEVER FIRED - 0 of 199"]
+
+    NOTE["THE RESULT<br/><br/>All three branches scored 100%.<br/>cheap and middle disagreed on 0 of 199 queries,<br/>so there is no quality signal to route on.<br/><br/>always-cheap  $0.001206 / query<br/>routed        $0.004949 / query<br/>4.1x the cost for identical accuracy"]
+
+    Q --> E
+    E --> L1
+    L1 -->|"YES - 55 of 199<br/>p_lookup 0.501-0.820<br/>median 0.668"| CHEAP
+    L1 -->|"NO - 144 queries<br/>p_lookup 0.150-0.494<br/>median 0.293"| GATE
+    GATE -->|"NO - 142 queries<br/>p_decompose 0.190-0.745<br/>median 0.400"| MID
+    GATE -->|"YES - only 2 of 199<br/>cleared 0.75"| GUARD
+    GUARD -->|"NO - bail-out<br/>projected $0.011506<br/>>= frontier $0.008140"| FRONT
+    GUARD -->|"YES"| L2
+
+    classDef cheapCls fill:#d4edda,stroke:#28a745,stroke-width:3px,color:#0b2e13
+    classDef midCls fill:#d6e4f7,stroke:#2b6cb0,stroke-width:4px,color:#0a2540
+    classDef frontCls fill:#fdebd0,stroke:#d68910,stroke-width:3px,color:#4a2c00
+    classDef deadCls fill:#ededed,stroke:#999999,stroke-width:2px,stroke-dasharray:6 4,color:#5c5c5c
+    classDef stepCls fill:#ffffff,stroke:#444444,stroke-width:2px,color:#111111
+    classDef gateCls fill:#fffdf0,stroke:#444444,stroke-width:2px,color:#111111
+    classDef noteCls fill:#fff9db,stroke:#b7950b,stroke-width:2px,color:#3d3000
+
+    class CHEAP cheapCls
+    class MID midCls
+    class FRONT frontCls
+    class L2 deadCls
+    class Q,E stepCls
+    class L1,GATE,GUARD gateCls
+    class NOTE noteCls

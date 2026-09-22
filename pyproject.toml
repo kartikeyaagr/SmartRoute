@@ -9,6 +9,7 @@ dependencies = [
     "litellm>=1.83.9",
     "pydantic-settings>=2.0",
     "python-dotenv>=1.0",
+    "pyyaml>=6.0",
 ]
 
 [project.optional-dependencies]
@@ -17,10 +18,9 @@ ml = [
     "transformers>=4.40",
     "torch>=2.2",
     "sentence-transformers>=3.0",
-]
-# uv sync --extra bench — MMLU benchmark harness
-bench = [
-    "datasets>=2.19",
+    # layer-1 triage heads: logistic regression over frozen MiniLM embeddings
+    "scikit-learn>=1.5",
+    "joblib>=1.4",
 ]
 # uv sync --extra server — FastAPI API server (server.py)
 # Server deps are optional: the library works without them.
@@ -65,4 +65,5 @@ testpaths = ["tests"]
 pythonpath = ["src"]
 markers = [
     "integration: requires real API keys (skipped by default)",
+    "real_triage: loads the real sentence-transformers encoder (slow)",
 ]

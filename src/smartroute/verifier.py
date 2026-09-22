@@ -3,18 +3,22 @@ CascadeVerifier: anti-self-grading cross-provider response quality check.
 
 Scores cheap model responses 1-5. Escalates to frontier if score < threshold.
 
-Anti-self-grading rule: verifier must differ from both cheap AND frontier models.
-  cheap=groq/llama-3.1-8b-instant → verifier=groq/qwen/qwen3-32b  (different arch)
-  cheap=anything-else             → verifier=groq/qwen/qwen3-32b   (default)
-
-Frontier is groq/llama-3.3-70b-versatile — verifier is intentionally kept off that
-model so the escalation path uses a genuinely different model.
+Anti-self-grading rule: the verifier must be a different model family from the model
+it scores. Which model that is comes from the catalog (role: judge), and catalog.py
+refuses to load a judge that shares a family with the cheap or middle tier.
 """
 
 import logging
 import re
 
+from smartroute.config import settings
+
+from typing import TYPE_CHECKING
+
 from smartroute.providers import ProviderError, call_model
+
+if TYPE_CHECKING:
+    from smartroute.catalog import ModelSpec
 
 logger = logging.getLogger(__name__)
 
@@ -39,19 +43,17 @@ No other text. No explanation."""
 
 _INT_RE = re.compile(r"\b([1-5])\b")
 
-# Anti-self-grading: verifier must differ from both cheap AND frontier models.
-# Frontier = groq/llama-3.3-70b-versatile, so verifier must NOT be that model.
-# Qwen3-32B is a different architecture (Alibaba) — good cross-family verifier.
-_VERIFIER_MODEL_FOR: dict[str, str] = {}  # no overrides needed; default covers all cases
-_DEFAULT_VERIFIER = "groq/qwen/qwen3-32b"
+def _pick_verifier(cheap_model: str) -> "ModelSpec":
+    """
+    The judge for a given cheap model.
 
+    Cross-family separation is guaranteed at catalog load, so this is a plain lookup;
+    the old prefix-override map (`_VERIFIER_MODEL_FOR`) was always empty and its loop
+    never iterated.
+    """
+    from smartroute.catalog import get_catalog
 
-def _pick_verifier(cheap_model: str) -> str:
-    """Select verifier model based on cheap model to avoid self-grading."""
-    for prefix, verifier in _VERIFIER_MODEL_FOR.items():
-        if cheap_model.startswith(prefix):
-            return verifier
-    return _DEFAULT_VERIFIER
+    return get_catalog().by_role("judge")
 
 
 def _parse_score(text: str) -> int | None:
@@ -83,7 +85,8 @@ class CascadeVerifier:
 
         Returns int 1-5. On parse failure after retry or timeout: returns 2 and logs WARNING.
         """
-        verifier_model = _pick_verifier(cheap_model)
+        verifier_spec = _pick_verifier(cheap_model)
+        verifier_model = verifier_spec.id
         messages = [
             {
                 "role": "user",
@@ -96,7 +99,8 @@ class CascadeVerifier:
             result = await call_model(
                 model=verifier_model,
                 messages=messages,
-                timeout_s=30.0,
+                timeout_s=settings.verifier_timeout_s,
+                spec=verifier_spec,
             )
             score = _parse_score(result.content)
             if score is not None:
@@ -122,7 +126,8 @@ class CascadeVerifier:
             result = await call_model(
                 model=verifier_model,
                 messages=strict_messages,
-                timeout_s=30.0,
+                timeout_s=settings.verifier_timeout_s,
+                spec=verifier_spec,
             )
             score = _parse_score(result.content)
             if score is not None:
