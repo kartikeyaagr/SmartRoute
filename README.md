@@ -1,12 +1,24 @@
-# SmartRoute
+<img src="assets/header.svg" width="100%" alt="SmartRoute" />
 
-An LLM inference router that sends each request to the cheapest model that can handle it — and the benchmark harness that tells you whether routing is worth doing at all.
+<p align="center">
+  <b>An LLM router that sends each request to the cheapest model that can handle it, plus the harness that tells you whether routing is worth doing at all.</b><br>
+  <sub>On 200 everyday queries routing didn't pay · Python, LiteLLM, MiniLM · Apr to Sep 2026</sub>
+</p>
+
+### at a glance
+
+```yaml
+what:    LLM inference router + benchmark harness
+result:  negative. always-cheap matched accuracy at about 1/4 the cost of routing
+stack:   [Python, LiteLLM, sentence-transformers, scikit-learn, FastAPI]
+default: Together AI catalog (models.yaml); Groq and Anthropic catalogs swappable
+built:   Apr to Sep 2026 · solo side project
+status:  router, harness, server, cache and observability built; 202 tests
+```
 
 The router is real and works. The harness is the reason this repo exists: run it against your own traffic before you believe anyone's cost-savings claim, including this one.
 
----
-
-## The headline finding
+### the headline finding
 
 On 200 questions written to resemble everyday assistant traffic, against a Claude
 ladder of Haiku 4.5 → Sonnet 5 → Opus 5:
@@ -31,9 +43,7 @@ so there is nothing to escalate for.
 does, this harness will show you; if it doesn't, it will save you from shipping a 4×
 bill for nothing. [Full benchmark documentation →](BENCHMARK.md)
 
----
-
-## Quickstart
+### quickstart
 
 Requires Python 3.13+ and [uv](https://docs.astral.sh/uv/).
 
@@ -77,9 +87,7 @@ uv run --extra ml harness/eval_routing.py --compare          # routing accuracy,
 uv run --extra ml harness/run_routing.py --n 200 --arm all   # live cost/accuracy, all arms
 ```
 
----
-
-## How routing works
+### how routing works
 
 ![Classifier flow with measured probabilities](diagrams/smartroute-classifier.png)
 
@@ -100,7 +108,7 @@ each routed independently, then synthesises. Guarded by a hard dollar check: if 
 projected split cost already exceeds one frontier call, the plan is discarded and that
 call is made instead.
 
-### Thresholds are derived, not guessed
+#### thresholds are derived, not guessed
 
 Diverting a lookup saves `(middle − cheap)` when right and costs `λ` when wrong, so
 breaking even requires:
@@ -120,9 +128,7 @@ which drops the threshold to 0.50 and sends 39% of multi-hop work to the weakest
 Same formula, same λ, opposite behaviour — because the economics changed underneath it.
 Set `λ` to what a wrong answer actually costs you.
 
----
-
-## Model-agnostic by construction
+### model-agnostic by construction
 
 Every model, price, and tier lives in `models.yaml`. Swapping providers is a config
 edit, and there is a test asserting exactly that.
@@ -151,9 +157,7 @@ The catalog refuses to load a configuration it cannot reason about:
 Prices resolve from LiteLLM's registry (4,326 models) with a YAML override. Shipped
 catalogs: `models.yaml` (Together AI), `models.anthropic.yaml`, `models.groq.yaml`.
 
----
-
-## What's in the box
+### what's in the box
 
 ```
 src/smartroute/
@@ -177,9 +181,7 @@ harness/
 
 202 tests, no network required.
 
----
-
-## Status and honest limits
+### status and honest limits
 
 The router, catalog, harness, server, cache, and observability are built and tested.
 What you should know before trusting any of it:
@@ -200,9 +202,7 @@ What you should know before trusting any of it:
   1.44× the frontier call it existed to avoid, at every output length. Replacing it
   with free logprob signals is unstarted.
 
----
-
-## Contributing
+### contributing
 
 The most useful contribution is a corpus that defeats the cheap tier. See
 [BENCHMARK.md](BENCHMARK.md#adding-your-own-corpus) — a corpus is a JSONL file plus a
@@ -213,8 +213,10 @@ uv run pytest                    # must stay green
 uv run --extra ml harness/eval_routing.py --compare   # routing didn't regress
 ```
 
-## License
+### license
 
 Not yet licensed. Contact kartikay3@outlook.com.
 
 *Last reviewed: 2026-09-22.*
+
+<img src="assets/footer.svg" width="100%" alt="" />
