@@ -116,6 +116,11 @@ class _SmartRouteMeta(BaseModel):
     gate_reason: str = ""
     projected_cost_usd: float = 0.0
     subtask_count: int = 0
+    # Task-ranked fields (DISPATCH=taskrank).
+    task_tag: str | None = None
+    effort_level: int | None = None
+    cost_tier_cap: str | None = None
+    decision_cost_usd: float = 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -205,6 +210,10 @@ async def chat_completions(body: ChatCompletionRequest) -> JSONResponse:
         gate_reason=decision.gate_reason,
         projected_cost_usd=decision.projected_cost_usd,
         subtask_count=decision.subtask_count,
+        task_tag=decision.task_tag,
+        effort_level=decision.effort_level,
+        cost_tier_cap=decision.cost_tier_cap,
+        decision_cost_usd=decision.decision_cost_usd,
     )
 
     if body.stream:
