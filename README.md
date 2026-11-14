@@ -132,12 +132,20 @@ Set `λ` to what a wrong answer actually costs you.
 
 An alternative dispatch that picks a model per prompt from OpenRouter's live data:
 
-1. **Classify** — one Decisions API call (`~typesafe/jev-latest` by default, set `DECISION_MODEL`) asks two questions in parallel: a *Choice* over OpenRouter's own task-classification tags, and a *Score* on a 4-level effort scale.
-2. **Rank** — candidates are the models with the most traffic for that tag (`GET /api/v1/classifications/task`), priced from `GET /api/v1/models`. Cached for 1h (the Data API allows 500 req/day).
+1. **Classify** — one Decisions API call (`~typesafe/jev-latest` by default, set `DECISION_MODEL`) asks two questions in parallel: a *Choice* of task type (`coding` / `agentic` / `general`), and a *Score* on a 4-level effort scale.
+2. **Rank by quality** — candidates are ordered by the matching Artificial Analysis index (`coding_index` / `agentic_index` / `intelligence_index`) from `GET /api/v1/benchmarks?source=artificial-analysis`, resolved to routable ids and priced via `GET /api/v1/models`. Cached for 1h (the Data API allows 500 req/day).
 3. **Cost-cap** — effort sets the highest allowed cost tier (budget ≤ $0.50/M, standard ≤ $2/M, premium ≤ $8/M, frontier open; blended 25% input / 75% output). Low effort confidence allows one tier higher.
-4. **Route** — the top survivor is called via `openrouter/<id>`; the next survivor on provider error. If selection itself fails, the request falls back to the catalog's default tier.
+4. **Route** — the best-scoring survivor is called via `openrouter/<id>`; the next survivor on provider error. If selection itself fails, the request falls back to the catalog's default tier.
 
-Requires `OPENROUTER_API_KEY`. The Decisions call's cost is added to `estimated_cost_usd`. Caveat: OpenRouter's task rankings are **usage share, not measured quality** — treat them as a prior and check with the harness. Tunables live in `TaskRouteConfig` (`src/smartroute/taskroute.py`).
+Requires `OPENROUTER_API_KEY`. The Decisions call's cost is added to `estimated_cost_usd`. Benchmark composites are not your traffic — check with the harness. Tunables live in `TaskRouteConfig` (`src/smartroute/taskroute.py`).
+
+### RouterBench replay
+
+`harness/routerbench.py` replays the two-layer decision router over [RouterBench](https://huggingface.co/datasets/withmartian/routerbench) (36,497 prompts with recorded score and cost for 11 models). Each tier maps to a RouterBench model, so the run calls no models and costs nothing:
+
+```bash
+uv run --extra ml --with pandas harness/routerbench.py --data routerbench_0shot.pkl
+```
 
 ### model-agnostic by construction
 

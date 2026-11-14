@@ -1,37 +1,39 @@
 """
-Task-ranked routing: decision model -> OpenRouter task rankings -> effort-based cost cap.
+Task-ranked routing: decision model -> benchmark quality per task -> effort-based cost cap.
 
 Pipeline
 --------
     prompt
       |
       +-- 1. ONE Decisions API call (Jev by default), two questions answered in parallel:
-      |        task   : Choice over OpenRouter's own task-classification tags
+      |        task   : Choice over the task types benchmarks score separately
       |        effort : Score on a 4-level effort scale
       |
-      +-- 2. candidates = models OpenRouter's community traffic uses most for that tag
-      |        (GET /api/v1/classifications/task), priced from GET /api/v1/models
+      +-- 2. candidates = models ranked by the benchmark index for that task
+      |        (GET /api/v1/benchmarks?source=artificial-analysis), priced and resolved
+      |        to routable ids from GET /api/v1/models
       |
       +-- 3. effort -> max cost tier; drop candidates above it
       |
-      +-- 4. call the highest-ranked survivor through OpenRouter; next survivor on error
+      +-- 4. call the best-scoring survivor through OpenRouter; next survivor on error
 
-Why the task buckets are OpenRouter's tags
-------------------------------------------
-Inventing our own buckets would need a hand-maintained mapping onto OpenRouter's
-taxonomy that drifts the moment they add a tag. Classifying straight into the tags the
-rankings are keyed on makes step 2 an exact lookup.
+Why exactly three task buckets
+------------------------------
+Artificial Analysis publishes three composite indices per model: coding, agentic and
+intelligence. A finer task taxonomy would only be mapped back onto those three, so
+classifying straight into them keeps step 2 an exact lookup and stops the Choice
+question spending probability mass on distinctions nothing downstream uses.
 
-What the rankings measure — read this
--------------------------------------
-`tag_usage_share` is *share of requests*, not quality. "Most used for code generation"
-is a popularity signal, confounded by price, defaults in popular apps, and free tiers.
-It is a reasonable prior, not evidence that a model solves the task best. The harness
-(harness/eval_routing.py) is the way to check whether this pays on your traffic.
+What the scores measure
+-----------------------
+These are benchmark composites, not your traffic. They beat usage share as a quality
+signal (popularity is confounded by price and app defaults), but a model that tops
+`coding_index` has not been shown to win on *your* coding prompts. Check with the
+harness.
 
 Rate limits
 -----------
-The Data API allows 30 req/min per key and 500 req/day per account, so rankings and
+The Data API allows 30 req/min per key and 500 req/day per account, so benchmarks and
 pricing are cached (default 1h TTL), never fetched per request.
 """
 
@@ -49,10 +51,27 @@ logger = logging.getLogger(__name__)
 
 OPENROUTER_BASE = "https://openrouter.ai"
 DECISIONS_PATH = "/api/alpha/decisions"
-CLASSIFICATIONS_PATH = "/api/v1/classifications/task"
+BENCHMARKS_PATH = "/api/v1/benchmarks"
 MODELS_PATH = "/api/v1/models"
 
 DEFAULT_DECISION_MODEL = "~typesafe/jev-latest"
+
+# task bucket -> (Choice criterion, Artificial Analysis index field)
+TASK_TYPES: dict[str, tuple[str, str]] = {
+    "coding": (
+        "Writing, reviewing, debugging or explaining code, scripts, queries or configs",
+        "coding_index",
+    ),
+    "agentic": (
+        "Multi-step tool use, planning and executing actions, or orchestrating a workflow",
+        "agentic_index",
+    ),
+    "general": (
+        "Knowledge questions, reasoning, math, analysis, writing, or anything else",
+        "intelligence_index",
+    ),
+}
+FALLBACK_TASK = "general"
 
 # Ordered low -> high. Score answers are indices into this list.
 EFFORT_LEVELS: tuple[str, ...] = (
@@ -86,8 +105,8 @@ class TaskRouteConfig:
     # Below this Score confidence, allow one tier higher: under-provisioning a hard
     # prompt costs a wrong answer, over-provisioning an easy one costs fractions of a cent.
     effort_confidence_floor: float = 0.6
-    # Below this Choice confidence the task label is not trusted; use the overall
-    # most-used models across all tags instead.
+    # Below this Choice confidence the task label is not trusted; rank by the general
+    # intelligence index instead.
     task_confidence_floor: float = 0.35
     # `:free` variants are rate-limited and frequently unavailable; off by default.
     allow_free: bool = False
@@ -101,17 +120,17 @@ class TaskRouteConfig:
 # ---------------------------------------------------------------------------
 
 @dataclass(frozen=True)
-class TaskTag:
-    tag: str
+class BenchmarkEntry:
+    permaslug: str
     display_name: str
-    macro_category: str
-    models: tuple[tuple[str, float], ...]  # (model id, tag_usage_share), ranked
+    scores: dict[str, float]      # index field -> score; only non-null indices present
+    price: Price | None           # pricing carried on the benchmark item, if any
 
 
 @dataclass(frozen=True)
 class Candidate:
-    model_id: str            # OpenRouter id, e.g. "openai/gpt-4.1-mini"
-    rank_share: float        # tag_usage_share
+    model_id: str            # routable OpenRouter id, e.g. "openai/gpt-4.1-mini"
+    quality: float           # benchmark index score for the chosen task
     price: Price
     blended_per_mtok: float
     tier: int                # index into COST_TIERS
@@ -150,15 +169,74 @@ class TaskRouteDecision:
 # OpenRouter clients
 # ---------------------------------------------------------------------------
 
+def _price(pricing: dict | None) -> Price | None:
+    """Per-token USD strings -> Price. None for missing or variable (-1) pricing."""
+    try:
+        price = Price(
+            input_per_token=float((pricing or {})["prompt"]),
+            output_per_token=float((pricing or {})["completion"]),
+        )
+    except (KeyError, TypeError, ValueError):
+        return None
+    if price.input_per_token < 0 or price.output_per_token < 0:
+        return None
+    return price
+
+
+def parse_benchmarks(payload: dict) -> list[BenchmarkEntry]:
+    index_fields = {f for _, f in TASK_TYPES.values()}
+    out = []
+    for item in payload.get("data") or []:
+        slug = item.get("model_permaslug")
+        if not slug:
+            continue
+        scores = {
+            f: float(item[f]) for f in index_fields if isinstance(item.get(f), (int, float))
+        }
+        if not scores:
+            continue
+        out.append(BenchmarkEntry(
+            permaslug=slug,
+            display_name=item.get("display_name") or slug,
+            scores=scores,
+            price=_price(item.get("pricing")),
+        ))
+    return out
+
+
+def parse_models(payload: dict) -> tuple[dict[str, str], dict[str, Price]]:
+    """
+    Returns (slug -> routable id, routable id -> price).
+
+    Benchmarks are keyed on permaslugs (often dated, e.g. `...-20241022`); chat
+    completions want the model `id`. /api/v1/models carries both as `canonical_slug`
+    and `id`, so it is the join table.
+    """
+    ids: dict[str, str] = {}
+    prices: dict[str, Price] = {}
+    for m in payload.get("data") or []:
+        mid = m.get("id")
+        if not mid:
+            continue
+        ids[mid] = mid
+        if m.get("canonical_slug"):
+            ids.setdefault(m["canonical_slug"], mid)
+        price = _price(m.get("pricing"))
+        if price is not None:
+            prices[mid] = price
+    return ids, prices
+
+
 class OpenRouterData:
-    """Cached access to the task rankings and model pricing."""
+    """Cached access to benchmark scores and model pricing."""
 
     def __init__(self, api_key: str, config: TaskRouteConfig, client: httpx.AsyncClient | None = None):
         self._key = api_key
         self._cfg = config
         self._client = client
-        self._tags: list[TaskTag] | None = None
-        self._prices: dict[str, Price] | None = None
+        self._bench: list[BenchmarkEntry] | None = None
+        self._ids: dict[str, str] = {}
+        self._prices: dict[str, Price] = {}
         self._as_of: str = ""
         self._fetched_at = 0.0
 
@@ -172,76 +250,46 @@ class OpenRouterData:
         return self._as_of
 
     def _fresh(self) -> bool:
-        return self._tags is not None and (time.monotonic() - self._fetched_at) < self._cfg.cache_ttl_s
+        return self._bench is not None and (time.monotonic() - self._fetched_at) < self._cfg.cache_ttl_s
 
     async def refresh(self, force: bool = False) -> None:
         if self._fresh() and not force:
             return
         headers = {"Authorization": f"Bearer {self._key}"}
         try:
-            cls = await self._http().get(CLASSIFICATIONS_PATH, params={"window": "7d"}, headers=headers)
-            cls.raise_for_status()
+            bench = await self._http().get(
+                BENCHMARKS_PATH,
+                params={"source": "artificial-analysis", "max_results": 100},
+                headers=headers,
+            )
+            bench.raise_for_status()
             models = await self._http().get(MODELS_PATH, headers=headers)
             models.raise_for_status()
         except httpx.HTTPError as exc:
-            if self._tags is not None:
-                # Stale rankings beat no rankings; they move over days, not minutes.
-                logger.warning("rankings refresh failed (%s) — serving stale snapshot from %s", exc, self._as_of)
+            if self._bench is not None:
+                # Stale scores beat no scores; benchmark composites move over weeks.
+                logger.warning("benchmark refresh failed (%s) — serving snapshot from %s", exc, self._as_of)
                 return
-            raise TaskRouteError(f"could not fetch OpenRouter rankings: {exc}") from exc
+            raise TaskRouteError(f"could not fetch OpenRouter benchmarks: {exc}") from exc
 
-        self._tags = parse_classifications(cls.json())
-        self._prices = parse_prices(models.json())
-        self._as_of = (cls.json().get("data") or {}).get("as_of", "")
+        self._bench = parse_benchmarks(bench.json())
+        self._ids, self._prices = parse_models(models.json())
+        self._as_of = (bench.json().get("meta") or {}).get("as_of", "")
         self._fetched_at = time.monotonic()
-        logger.info("loaded %d task tags, %d priced models (as of %s)",
-                    len(self._tags), len(self._prices), self._as_of)
+        logger.info("loaded %d benchmarked models, %d priced models (as of %s)",
+                    len(self._bench), len(self._prices), self._as_of)
 
-    async def tags(self) -> list[TaskTag]:
+    async def benchmarks(self) -> list[BenchmarkEntry]:
         await self.refresh()
-        return self._tags or []
+        return self._bench or []
 
-    async def prices(self) -> dict[str, Price]:
+    async def resolve(self, slug: str) -> str | None:
         await self.refresh()
-        return self._prices or {}
+        return self._ids.get(slug) or self._ids.get(slug.split(":")[0])
 
-
-def parse_classifications(payload: dict) -> list[TaskTag]:
-    data = payload.get("data") or {}
-    out = []
-    for c in data.get("classifications") or []:
-        models = tuple(
-            (m["id"], float(m.get("tag_usage_share") or 0.0))
-            for m in (c.get("models") or [])
-            if m.get("id")
-        )
-        out.append(TaskTag(
-            tag=c["tag"],
-            display_name=c.get("display_name") or c["tag"],
-            macro_category=c.get("macro_category") or "",
-            models=tuple(sorted(models, key=lambda m: -m[1])),
-        ))
-    return out
-
-
-def parse_prices(payload: dict) -> dict[str, Price]:
-    """Index /api/v1/models pricing by both `id` and `canonical_slug`. Per-token USD strings."""
-    out: dict[str, Price] = {}
-    for m in payload.get("data") or []:
-        pricing = m.get("pricing") or {}
-        try:
-            price = Price(
-                input_per_token=float(pricing["prompt"]),
-                output_per_token=float(pricing["completion"]),
-            )
-        except (KeyError, TypeError, ValueError):
-            continue
-        if price.input_per_token < 0 or price.output_per_token < 0:
-            continue  # OpenRouter uses -1 for variable-priced routers
-        for key in (m.get("id"), m.get("canonical_slug")):
-            if key:
-                out[key] = price
-    return out
+    async def price(self, model_id: str) -> Price | None:
+        await self.refresh()
+        return self._prices.get(model_id)
 
 
 class DecisionsClient:
@@ -310,15 +358,12 @@ class TaskRanker:
     # -- questions ---------------------------------------------------------
 
     @staticmethod
-    def _questions(tags: list[TaskTag]) -> dict:
+    def _questions() -> dict:
         return {
             "task": {
                 "type": "choice",
                 "instructions": "Which kind of task is the user's latest message asking for?",
-                "criteria": {
-                    t.tag: f"{t.display_name} ({t.macro_category})" if t.macro_category else t.display_name
-                    for t in tags
-                },
+                "criteria": {k: desc for k, (desc, _) in TASK_TYPES.items()},
             },
             "effort": {
                 "type": "score",
@@ -329,7 +374,8 @@ class TaskRanker:
             },
         }
 
-    def _effort(self, answer: dict) -> tuple[int, float, float]:
+    @staticmethod
+    def _effort(answer: dict) -> tuple[int, float, float]:
         score = float(answer.get("score", 1.0))
         confidence = float(answer.get("confidence", 0.0))
         probs = answer.get("probabilities") or {}
@@ -342,41 +388,45 @@ class TaskRanker:
 
     # -- selection ---------------------------------------------------------
 
-    def _overall(self, tags: list[TaskTag]) -> tuple[tuple[str, float], ...]:
-        """Usage-weighted ranking across every tag, for when the task label is unsure."""
-        totals: dict[str, float] = {}
-        for t in tags:
-            for mid, share in t.models:
-                totals[mid] = totals.get(mid, 0.0) + share
-        return tuple(sorted(totals.items(), key=lambda m: -m[1]))
-
-    def rank_candidates(
-        self,
-        ranked: tuple[tuple[str, float], ...],
-        prices: dict[str, Price],
-        max_tier: int,
+    async def rank_candidates(
+        self, bench: list[BenchmarkEntry], index_field: str, max_tier: int
     ) -> tuple[list[Candidate], dict[str, str]]:
+        scored = sorted(
+            (b for b in bench if index_field in b.scores),
+            key=lambda b: -b.scores[index_field],
+        )
         kept: list[Candidate] = []
-        rejected: dict[str, str] = {}
         priced: list[Candidate] = []
-        for mid, share in ranked:
+        rejected: dict[str, str] = {}
+        seen: set[str] = set()
+        for b in scored:
+            mid = await self._data.resolve(b.permaslug)
+            if mid is None:
+                rejected[b.permaslug] = "not routable on OpenRouter"
+                continue
+            if mid in seen:
+                continue
+            seen.add(mid)
             if mid.endswith(":free") and not self.config.allow_free:
                 rejected[mid] = "free variant"
                 continue
-            price = prices.get(mid)
+            price = await self._data.price(mid) or b.price
             if price is None:
                 rejected[mid] = "no OpenRouter price"
                 continue
-            b = self.blended(price)
-            c = Candidate(model_id=mid, rank_share=share, price=price, blended_per_mtok=b, tier=self.tier_of(b))
+            blended = self.blended(price)
+            c = Candidate(
+                model_id=mid, quality=b.scores[index_field], price=price,
+                blended_per_mtok=blended, tier=self.tier_of(blended),
+            )
             priced.append(c)
             if c.tier > max_tier:
-                rejected[mid] = f"{COST_TIERS[c.tier]} > {COST_TIERS[max_tier]} cap (${b:.2f}/M)"
+                rejected[mid] = f"{COST_TIERS[c.tier]} > {COST_TIERS[max_tier]} cap (${blended:.2f}/M)"
                 continue
             kept.append(c)
 
         if not kept and priced:
-            # Every ranked model is above the cap. Take the cheapest rather than nothing:
+            # Every scored model is above the cap. Take the cheapest rather than nothing:
             # the cap is a cost preference, not a reason to fail the request.
             cheapest = min(priced, key=lambda c: c.blended_per_mtok)
             rejected.pop(cheapest.model_id, None)
@@ -384,20 +434,22 @@ class TaskRanker:
         return kept[: self.config.max_candidates], rejected
 
     async def select(self, prompt: str) -> TaskRouteDecision:
-        tags = await self._data.tags()
-        if not tags:
-            raise TaskRouteError("OpenRouter returned no task classifications")
-        prices = await self._data.prices()
+        bench = await self._data.benchmarks()
+        if not bench:
+            raise TaskRouteError("OpenRouter returned no benchmark scores")
 
         answers, cost = await self._decisions.decide(
             state={"user_message": prompt[:_PROMPT_CHARS]},
-            questions=self._questions(tags),
+            questions=self._questions(),
         )
 
         task = answers.get("task") or {}
-        tag_key = task.get("choice")
+        chosen = task.get("choice")
         task_conf = float(task.get("confidence", 0.0))
-        by_tag = {t.tag: t for t in tags}
+        trusted = chosen in TASK_TYPES and task_conf >= self.config.task_confidence_floor
+        task_key = chosen if trusted else FALLBACK_TASK
+        index_field = TASK_TYPES[task_key][1]
+        label = index_field if trusted else f"{index_field} (low task confidence on {chosen!r})"
 
         level, score, eff_conf = self._effort(answers.get("effort") or {})
         max_tier = self.config.effort_to_max_tier[level]
@@ -405,26 +457,20 @@ class TaskRanker:
         if bumped:
             max_tier += 1
 
-        if tag_key in by_tag and task_conf >= self.config.task_confidence_floor:
-            tag = by_tag[tag_key]
-            ranked, label = tag.models, tag.display_name
-        else:
-            ranked, label = self._overall(tags), "overall (low task confidence)"
-            tag_key = tag_key or "unknown"
-
-        candidates, rejected = self.rank_candidates(ranked, prices, max_tier)
+        candidates, rejected = await self.rank_candidates(bench, index_field, max_tier)
         if not candidates:
-            raise TaskRouteError(f"no priced candidates for task {tag_key!r}")
+            raise TaskRouteError(f"no priced, routable candidates scored on {index_field}")
 
+        top = candidates[0]
         reason = (
-            f"task={tag_key} ({label}) conf={task_conf:.2f}; "
+            f"task={task_key} conf={task_conf:.2f} -> {label}; "
             f"effort={level} score={score:.2f} conf={eff_conf:.2f}"
             f"{' (+1 tier, low confidence)' if bumped else ''}; "
-            f"cap={COST_TIERS[max_tier]}; pick={candidates[0].model_id} "
-            f"(${candidates[0].blended_per_mtok:.2f}/M, share={candidates[0].rank_share:.2f})"
+            f"cap={COST_TIERS[max_tier]}; pick={top.model_id} "
+            f"({index_field}={top.quality:.1f}, ${top.blended_per_mtok:.2f}/M)"
         )
         return TaskRouteDecision(
-            task_tag=tag_key,
+            task_tag=task_key,
             task_label=label,
             task_confidence=task_conf,
             effort_level=level,
@@ -436,4 +482,3 @@ class TaskRanker:
             reason=reason,
             rejected=rejected,
         )
-
