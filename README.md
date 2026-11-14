@@ -139,13 +139,21 @@ An alternative dispatch that picks a model per prompt from OpenRouter's live dat
 
 Requires `OPENROUTER_API_KEY`. The Decisions call's cost is added to `estimated_cost_usd`. Benchmark composites are not your traffic — check with the harness. Tunables live in `TaskRouteConfig` (`src/smartroute/taskroute.py`).
 
+### Jev-verified escalation (`JEV_ESCALATION=true`)
+
+With the default two-layer dispatch, every middle-tier answer can be checked by a decision model: one Noul question to Jev ("does this response correctly and fully answer the message?") returns P(correct). Below the threshold the frontier model answers instead. The default threshold comes from the catalog — escalate when `(1 - p) * lambda_wrong_answer_usd > frontier cost` — but Jev's probabilities are not calibrated to your traffic, so set `JEV_ESCALATION_THRESHOLD` from a labelled run (`harness/routerbench.py --jev-verify N`). If the check fails, the middle answer is kept. The check's cost is added to `estimated_cost_usd`.
+
 ### RouterBench replay
 
 `harness/routerbench.py` replays the two-layer decision router over [RouterBench](https://huggingface.co/datasets/withmartian/routerbench) (36,497 prompts with recorded score and cost for 11 models). Each tier maps to a RouterBench model, so the run calls no models and costs nothing:
 
 ```bash
 uv run --extra ml --with pandas harness/routerbench.py --data routerbench_0shot.pkl
+# + live Jev checks of 500 recorded middle answers (needs OPENROUTER_API_KEY, costs money)
+uv run --extra ml --with pandas harness/routerbench.py --data routerbench_0shot.pkl --jev-verify 500
 ```
+
+Every run also prints an escalation ceiling: accuracy and cost if a checker with a given detection rate and false-alarm rate escalated middle answers to the frontier.
 
 ### model-agnostic by construction
 

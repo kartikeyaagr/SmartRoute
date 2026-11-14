@@ -121,6 +121,7 @@ class _SmartRouteMeta(BaseModel):
     effort_level: int | None = None
     cost_tier_cap: str | None = None
     decision_cost_usd: float = 0.0
+    escalation_p_correct: float | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -214,6 +215,7 @@ async def chat_completions(body: ChatCompletionRequest) -> JSONResponse:
         effort_level=decision.effort_level,
         cost_tier_cap=decision.cost_tier_cap,
         decision_cost_usd=decision.decision_cost_usd,
+        escalation_p_correct=decision.escalation_p_correct,
     )
 
     if body.stream:
