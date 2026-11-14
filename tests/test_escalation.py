@@ -130,3 +130,49 @@ class TestRouterEscalation:
         with patch("smartroute.router.call_model", new=AsyncMock(side_effect=lambda m, *a, **k: _resp(m))):
             _, d = await router.route_async([{"role": "user", "content": "q"}])
         assert d.escalation_p_correct is None
+
+
+class _Head:
+    def predict_proba(self, x):
+        return [[0.8, 0.2]]
+
+
+class TestLearnedAndEnsemble:
+    async def test_learned_checker_escalates_below_threshold(self, tmp_path, monkeypatch):
+        import joblib
+        from smartroute.escalation import LearnedVerifier
+
+        path = tmp_path / "c.joblib"
+        joblib.dump({"head": _Head(), "encoder": "x", "tail_chars": 10}, path)
+        v = LearnedVerifier(threshold=0.5, path=path)
+        monkeypatch.setattr(v, "_p_correct", lambda p, r: 0.2)
+        r = await v.check("q", "a")
+        assert r.escalate is True and r.p_correct == 0.2 and r.cost_usd == 0.0
+
+    def test_missing_checker_file_is_a_taskroute_error(self, tmp_path):
+        from smartroute.escalation import LearnedVerifier
+        with pytest.raises(TaskRouteError):
+            LearnedVerifier(threshold=0.5, path=tmp_path / "missing.joblib")
+
+    async def test_ensemble_averages_and_sums_cost(self):
+        from smartroute.escalation import EnsembleVerifier, VerifyResult
+
+        class Fixed:
+            def __init__(self, p, cost):
+                self.p, self.cost = p, cost
+            async def check(self, prompt, response):
+                return VerifyResult(self.p, False, self.cost, f"p={self.p}")
+        r = await EnsembleVerifier([Fixed(0.9, 0.00003), Fixed(0.3, 0.0)], threshold=0.7).check("q", "a")
+        assert r.p_correct == pytest.approx(0.6) and r.escalate is True
+        assert r.cost_usd == pytest.approx(0.00003)
+
+    async def test_ensemble_ignores_failed_checker(self):
+        from smartroute.escalation import EnsembleVerifier, VerifyResult
+
+        class Fixed:
+            def __init__(self, p):
+                self.p = p
+            async def check(self, prompt, response):
+                return VerifyResult(self.p, False, 0.0, "")
+        r = await EnsembleVerifier([Fixed(None), Fixed(0.9)], threshold=0.7).check("q", "a")
+        assert r.p_correct == 0.9 and r.escalate is False

@@ -143,17 +143,21 @@ Requires `OPENROUTER_API_KEY`. The Decisions call's cost is added to `estimated_
 
 With the default two-layer dispatch, every middle-tier answer can be checked by a decision model: one Noul question to Jev ("does this response correctly and fully answer the message?") returns P(correct). Below the threshold the frontier model answers instead. The default threshold comes from the catalog — escalate when `(1 - p) * lambda_wrong_answer_usd > frontier cost` — but Jev's probabilities are not calibrated to your traffic, so set `JEV_ESCALATION_THRESHOLD` from a labelled run (`harness/routerbench.py --jev-verify N`). If the check fails, the middle answer is kept. The check's cost is added to `estimated_cost_usd`.
 
+### learned answer checker (`ESCALATION_CHECKER=learned|both`)
+
+A classifier over MiniLM embeddings of (prompt, answer) that predicts P(correct), trained by `harness/train_checker.py` on graded answers — ideally your own middle model's, as JSONL `{"prompt", "response", "correct"}`. `both` averages it with Jev. It costs no API call; it is only as good as the match between its training answers and the model it checks.
+
 ### RouterBench replay
 
 `harness/routerbench.py` replays the two-layer decision router over [RouterBench](https://huggingface.co/datasets/withmartian/routerbench) (36,497 prompts with recorded score and cost for 11 models). Each tier maps to a RouterBench model, so the run calls no models and costs nothing:
 
 ```bash
-uv run --extra ml --with pandas harness/routerbench.py --data routerbench_0shot.pkl
+uv run --extra ml --with pandas harness/routerbench.py --data routerbench_5shot.pkl
 # + live Jev checks of 500 recorded middle answers (needs OPENROUTER_API_KEY, costs money)
-uv run --extra ml --with pandas harness/routerbench.py --data routerbench_0shot.pkl --jev-verify 500
+uv run --extra ml --with pandas harness/routerbench.py --data routerbench_5shot.pkl --jev-verify 500
 ```
 
-Every run also prints an escalation ceiling: accuracy and cost if a checker with a given detection rate and false-alarm rate escalated middle answers to the frontier.
+Prompts split 70/30; the learned checker trains on the 70% and everything is reported on the 30%. Each run sweeps the cost-of-a-wrong-answer setting and the checker threshold, and reports the paper's AIQ (area under the non-decreasing convex hull of cost vs accuracy) against the Zero router, plus the cost to reach 95% of frontier accuracy. Use the 5-shot file: its per-model scores match the RouterBench paper; the 0-shot file's do not.
 
 ### model-agnostic by construction
 

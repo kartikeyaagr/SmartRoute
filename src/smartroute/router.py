@@ -194,7 +194,7 @@ class Router:
     @property
     def escalator(self) -> "JevVerifier":
         if self._escalator is None:
-            from smartroute.escalation import JevVerifier, derived_threshold
+            from smartroute.escalation import derived_threshold
 
             frontier = self._catalog.by_role("frontier")
             threshold = settings.jev_escalation_threshold
@@ -203,11 +203,7 @@ class Router:
                 threshold = derived_threshold(
                     frontier.cost(128, 300), self._catalog.lambda_wrong_answer_usd
                 )
-            self._escalator = JevVerifier(
-                api_key=settings.openrouter_api_key,
-                threshold=threshold,
-                model=settings.decision_model,
-            )
+            self._escalator = build_checker(settings.escalation_checker, threshold)
         return self._escalator
 
     async def _maybe_escalate(
@@ -611,6 +607,34 @@ class Router:
                 self.route_async(messages, request_id=request_id),
             )
             return future.result()
+
+
+def build_checker(kind: str, threshold: float):
+    """jev | learned | both. `both` averages whichever checkers could be built."""
+    from smartroute.escalation import EnsembleVerifier, JevVerifier, LearnedVerifier
+    from smartroute.taskroute import TaskRouteError
+
+    def jev():
+        return JevVerifier(settings.openrouter_api_key, threshold=threshold, model=settings.decision_model)
+
+    def learned():
+        return LearnedVerifier(threshold=threshold)
+
+    if kind == "jev":
+        return jev()
+    if kind == "learned":
+        return learned()
+    if kind != "both":
+        raise ValueError(f"ESCALATION_CHECKER must be jev, learned or both, got {kind!r}")
+    built = []
+    for make in (jev, learned):
+        try:
+            built.append(make())
+        except TaskRouteError as exc:
+            logger.warning("checker unavailable: %s", exc)
+    if not built:
+        raise TaskRouteError("no escalation checker could be built")
+    return built[0] if len(built) == 1 else EnsembleVerifier(built, threshold)
 
 
 def _extract_last_user_message(messages: list[dict]) -> str:
