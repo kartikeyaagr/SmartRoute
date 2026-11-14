@@ -35,8 +35,10 @@ silent jump to frontier pricing.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass
+from pathlib import Path
 
 import httpx
 
@@ -122,3 +124,93 @@ class JevVerifier:
             cost_usd=cost,
             reason=f"jev p_correct={p:.2f} {'<' if escalate else '>='} {self.threshold:.2f}",
         )
+
+
+# ---------------------------------------------------------------------------
+# Learned checker: P(correct) from embeddings of the prompt and the answer
+# ---------------------------------------------------------------------------
+
+DEFAULT_CHECKER_PATH = Path(__file__).parent / "data" / "checker.joblib"
+
+
+def pair_features(prompt_emb, response_emb):
+    """[p, r, p*r, |p-r|] — the standard pair encoding for a pair classifier."""
+    import numpy as np
+
+    return np.hstack([prompt_emb, response_emb, prompt_emb * response_emb, np.abs(prompt_emb - response_emb)])
+
+
+def tail(text: str, chars: int) -> str:
+    """The question sits at the end of few-shot prompts; a 256-token encoder sees the start."""
+    return text[-chars:] if chars and len(text) > chars else text
+
+
+class LearnedVerifier:
+    """
+    Classifier over frozen MiniLM embeddings of (prompt, answer), trained on graded
+    answers by harness/train_checker.py.
+
+    It is only as good as the match between its training answers and the model it
+    checks: a checker fitted on Mixtral's RouterBench answers has not seen gpt-oss.
+    Train it on labelled answers from the middle model you actually run.
+    """
+
+    def __init__(self, threshold: float, path: Path | None = None) -> None:
+        try:
+            import joblib
+        except ImportError as exc:
+            raise TaskRouteError("learned checker needs the ml extra: uv sync --extra ml") from exc
+
+        path = path or DEFAULT_CHECKER_PATH
+        if not path.exists():
+            raise TaskRouteError(f"no trained checker at {path}; run harness/train_checker.py")
+        bundle = joblib.load(path)
+        self._head = bundle["head"]
+        self._encoder_name = bundle["encoder"]
+        self._tail_chars = int(bundle.get("tail_chars", 1000))
+        self.trained_on = bundle.get("trained_on", "")
+        self.threshold = threshold
+        self._encoder = None
+
+    def _p_correct(self, prompt: str, response: str) -> float:
+        if self._encoder is None:
+            from sentence_transformers import SentenceTransformer
+
+            self._encoder = SentenceTransformer(self._encoder_name)
+        e = self._encoder.encode(
+            [tail(prompt, self._tail_chars), tail(response, self._tail_chars)],
+            normalize_embeddings=True,
+        )
+        return float(self._head.predict_proba(pair_features(e[:1], e[1:2]))[0][1])
+
+    async def check(self, prompt: str, response: str) -> VerifyResult:
+        if not response.strip():
+            return VerifyResult(p_correct=0.0, escalate=True, cost_usd=0.0, reason="empty middle answer")
+        try:
+            p = await asyncio.to_thread(self._p_correct, prompt, response)
+        except Exception as exc:  # inference failure must not fail the request
+            logger.warning("learned checker failed: %s — keeping middle answer", exc)
+            return VerifyResult(None, False, 0.0, f"learned check failed ({exc}); kept middle")
+        escalate = p < self.threshold
+        return VerifyResult(p, escalate, 0.0,
+                            f"learned p_correct={p:.2f} {'<' if escalate else '>='} {self.threshold:.2f}")
+
+
+class EnsembleVerifier:
+    """Mean P(correct) of the checkers that answered; escalates on the mean."""
+
+    def __init__(self, verifiers: list, threshold: float) -> None:
+        self._verifiers = verifiers
+        self.threshold = threshold
+
+    async def check(self, prompt: str, response: str) -> VerifyResult:
+        results = await asyncio.gather(*(v.check(prompt, response) for v in self._verifiers))
+        cost = sum(r.cost_usd for r in results)
+        ps = [r.p_correct for r in results if r.p_correct is not None]
+        if not ps:
+            return VerifyResult(None, False, cost, "all checkers failed; kept middle")
+        p = sum(ps) / len(ps)
+        escalate = p < self.threshold
+        parts = ", ".join(r.reason for r in results)
+        return VerifyResult(p, escalate, cost,
+                            f"ensemble p_correct={p:.2f} {'<' if escalate else '>='} {self.threshold:.2f} [{parts}]")

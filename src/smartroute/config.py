@@ -30,6 +30,9 @@ class Settings(BaseSettings):
     # 1 - frontier_cost / lambda_wrong_answer_usd. Calibrate it; Jev's probabilities
     # are not calibrated to your traffic.
     jev_escalation_threshold: float | None = None
+    # Which checker scores middle answers: "jev" | "learned" | "both" (mean P(correct)).
+    # "learned" needs src/smartroute/data/checker.joblib (harness/train_checker.py).
+    escalation_checker: str = "jev"
 
     # Model catalog — path to models.yaml. Empty = repo-root models.yaml.
     catalog_path: str = ""
