@@ -31,6 +31,7 @@ from smartroute.verifier import CascadeVerifier
 if TYPE_CHECKING:
     from smartroute.decision import DecisionLayer
     from smartroute.decomposer import Decomposer
+    from smartroute.taskroute import TaskRanker
 
 logger = logging.getLogger(__name__)
 
@@ -66,6 +67,14 @@ class RoutingDecision:
     p_decompose: float | None = None
     projected_cost_usd: float = 0.0
     subtask_count: int = 0
+
+    # Task-ranked fields (dispatch="taskrank")
+    task_tag: str | None = None            # OpenRouter task-classification tag
+    task_confidence: float | None = None
+    effort_level: int | None = None        # 0 trivial .. 3 hard
+    effort_confidence: float | None = None
+    cost_tier_cap: str | None = None       # budget | standard | premium | frontier
+    decision_cost_usd: float = 0.0         # Decisions API call; included in estimated_cost_usd
 
 
 def _hash_prompt(messages: list[dict]) -> str:
@@ -108,15 +117,20 @@ class Router:
         log_path: Path | None = None,
         verifier_enabled: bool = True,
         catalog: Catalog | None = None,
-        dispatch: str = "decision",
+        dispatch: str | None = None,
         decision_layer: "DecisionLayer | None" = None,
         decomposer: "Decomposer | None" = None,
+        task_ranker: "TaskRanker | None" = None,
     ) -> None:
-        if dispatch not in ("decision", "cascade"):
-            raise ValueError(f"dispatch must be 'decision' or 'cascade', got {dispatch!r}")
+        dispatch = dispatch or settings.dispatch
+        if dispatch not in ("decision", "cascade", "taskrank"):
+            raise ValueError(
+                f"dispatch must be 'decision', 'cascade' or 'taskrank', got {dispatch!r}"
+            )
         self._dispatch_mode = dispatch
         self._decision_layer = decision_layer
         self._decomposer = decomposer
+        self._task_ranker = task_ranker
         self._catalog = catalog or get_catalog()
         self._classifier = classifier or get_classifier(settings.classifier)
         self._verifier = verifier or CascadeVerifier()
@@ -152,6 +166,17 @@ class Router:
 
             self._decomposer = Decomposer(catalog=self._catalog)
         return self._decomposer
+
+    @property
+    def task_ranker(self) -> "TaskRanker":
+        if self._task_ranker is None:
+            from smartroute.taskroute import TaskRanker, TaskRouteConfig
+
+            self._task_ranker = TaskRanker(
+                api_key=settings.openrouter_api_key,
+                config=TaskRouteConfig(decision_model=settings.decision_model),
+            )
+        return self._task_ranker
 
     async def route_async(
         self,
@@ -194,6 +219,8 @@ class Router:
 
         if self._dispatch_mode == "decision":
             return await self._route_by_decision(messages, prompt_text, rid, t0, params)
+        if self._dispatch_mode == "taskrank":
+            return await self._route_by_task_rank(messages, prompt_text, rid, t0, params)
 
         tier, score = self._classifier.classify(messages)
 
@@ -281,6 +308,91 @@ class Router:
         if self._log_path:
             await _append_decision(self._log_path, decision)
         return content, decision
+
+    async def _route_by_task_rank(
+        self,
+        messages: list[dict],
+        prompt_text: str,
+        rid: str,
+        t0: float,
+        params: dict | None = None,
+    ) -> tuple[str, RoutingDecision]:
+        """
+        Decision model (task + effort) -> OpenRouter task rankings -> cost-tier cap.
+
+        If the selection step itself fails (rankings or Decisions API unreachable, no
+        key), the request falls back to the catalog's default tier rather than failing:
+        routing is an optimisation, and an outage in it must not take answers down too.
+        """
+        from smartroute.taskroute import TaskRouteError
+
+        decision = RoutingDecision(
+            request_id=rid,
+            prompt_hash=_hash_prompt(messages),
+            difficulty_tier="TASKRANK",
+            difficulty_score=0.0,
+            classifier_backend="decisions-api",
+        )
+
+        try:
+            try:
+                route = await self.task_ranker.select(prompt_text)
+            except TaskRouteError as exc:
+                logger.warning("task-ranked selection failed: %s — using default tier", exc)
+                decision.route_path = self._catalog.default.role
+                decision.gate_reason = f"taskrank unavailable ({exc}); default tier"
+                content = await self._call_tier(
+                    self._catalog.default.role, messages, decision, params or {}
+                )
+            else:
+                decision.difficulty_tier = f"EFFORT_{route.effort_level}"
+                decision.difficulty_score = route.effort_confidence
+                decision.route_path = route.max_tier_name
+                decision.gate_reason = route.reason
+                decision.task_tag = route.task_tag
+                decision.task_confidence = route.task_confidence
+                decision.effort_level = route.effort_level
+                decision.effort_confidence = route.effort_confidence
+                decision.cost_tier_cap = route.max_tier_name
+                decision.decision_cost_usd = route.decision_cost_usd
+                decision.estimated_cost_usd += route.decision_cost_usd
+                content = await self._call_candidates(
+                    route.candidates, messages, decision, params or {}
+                )
+        except Exception as exc:
+            decision.error = str(exc)
+            decision.latency_ms = (time.perf_counter() - t0) * 1000
+            if self._log_path:
+                await _append_decision(self._log_path, decision)
+            raise
+
+        decision.latency_ms = (time.perf_counter() - t0) * 1000
+        await self._cache.put(prompt_text, content)
+        if self._log_path:
+            await _append_decision(self._log_path, decision)
+        return content, decision
+
+    async def _call_candidates(self, candidates, messages, decision, params) -> str:
+        """Highest-ranked candidate first; next one on provider error."""
+        last_error: Exception | None = None
+        for i, cand in enumerate(candidates):
+            spec = cand.spec()
+            decision.cascade_path.append(spec.id)
+            try:
+                resp = await call_model(
+                    spec.id, messages, timeout_s=settings.model_timeout_s, spec=spec, **params
+                )
+            except ProviderError as exc:
+                logger.warning("taskrank candidate %s failed: %s — trying next", spec.id, exc)
+                last_error = exc
+                continue
+            decision.final_model = spec.id
+            decision.escalated = i > 0
+            decision.input_tokens += resp.input_tokens
+            decision.output_tokens += resp.output_tokens
+            decision.estimated_cost_usd += resp.estimated_cost_usd
+            return resp.content
+        raise ProviderError(f"all taskrank candidates failed. Last error: {last_error}")
 
     async def _call_tier(
         self, role: str, messages: list[dict], decision: RoutingDecision,

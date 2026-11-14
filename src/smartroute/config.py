@@ -16,6 +16,13 @@ class Settings(BaseSettings):
     gemini_api_key: str = ""
     groq_api_key: str = ""
     togetherai_api_key: str = ""
+    openrouter_api_key: str = ""
+
+    # Router dispatch: "decision" (two-layer, default) | "cascade" | "taskrank"
+    # taskrank = Decisions-API task + effort classification -> OpenRouter task rankings
+    # -> effort-based cost-tier cap -> call via OpenRouter. Needs OPENROUTER_API_KEY.
+    dispatch: str = "decision"
+    decision_model: str = "~typesafe/jev-latest"
 
     # Model catalog — path to models.yaml. Empty = repo-root models.yaml.
     catalog_path: str = ""
@@ -68,3 +75,5 @@ if settings.groq_api_key:
     os.environ.setdefault("GROQ_API_KEY", settings.groq_api_key)
 if settings.togetherai_api_key:
     os.environ.setdefault("TOGETHERAI_API_KEY", settings.togetherai_api_key)
+if settings.openrouter_api_key:
+    os.environ.setdefault("OPENROUTER_API_KEY", settings.openrouter_api_key)
