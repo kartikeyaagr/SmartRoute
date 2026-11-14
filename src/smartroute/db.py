@@ -54,6 +54,8 @@ CREATE TABLE IF NOT EXISTS routing_decisions (
     effort_confidence DOUBLE PRECISION,
     cost_tier_cap   TEXT,
     decision_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
+    escalation_p_correct DOUBLE PRECISION,
+    escalation_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
 )
 """
@@ -75,6 +77,8 @@ _MIGRATIONS = [
     "ALTER TABLE routing_decisions ADD COLUMN IF NOT EXISTS effort_confidence DOUBLE PRECISION",
     "ALTER TABLE routing_decisions ADD COLUMN IF NOT EXISTS cost_tier_cap TEXT",
     "ALTER TABLE routing_decisions ADD COLUMN IF NOT EXISTS decision_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0",
+    "ALTER TABLE routing_decisions ADD COLUMN IF NOT EXISTS escalation_p_correct DOUBLE PRECISION",
+    "ALTER TABLE routing_decisions ADD COLUMN IF NOT EXISTS escalation_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0",
 ]
 
 _INSERT = """
@@ -84,9 +88,10 @@ INSERT INTO routing_decisions (
     input_tokens, output_tokens, estimated_cost_usd, latency_ms,
     classifier_backend, cache_hit, cache_similarity, error,
     route_path, gate_reason, p_lookup, p_decompose, projected_cost_usd, subtask_count,
-    task_tag, task_confidence, effort_level, effort_confidence, cost_tier_cap, decision_cost_usd
+    task_tag, task_confidence, effort_level, effort_confidence, cost_tier_cap, decision_cost_usd,
+    escalation_p_correct, escalation_cost_usd
 ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,
-          $23,$24,$25,$26,$27,$28)
+          $23,$24,$25,$26,$27,$28,$29,$30)
 """
 
 
@@ -152,6 +157,8 @@ async def insert_decision(decision) -> None:
                 d.get("effort_confidence"),
                 d.get("cost_tier_cap"),
                 d.get("decision_cost_usd", 0.0),
+                d.get("escalation_p_correct"),
+                d.get("escalation_cost_usd", 0.0),
             )
     except Exception as exc:
         # Never let a DB write failure kill the API response. Logged at ERROR rather

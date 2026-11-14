@@ -24,6 +24,13 @@ class Settings(BaseSettings):
     dispatch: str = "decision"
     decision_model: str = "~typesafe/jev-latest"
 
+    # Jev check of middle-tier answers (dispatch="decision"); escalates to frontier on fail.
+    jev_escalation: bool = False
+    # Escalate when Jev's P(correct) is below this. Unset = derived from the catalog:
+    # 1 - frontier_cost / lambda_wrong_answer_usd. Calibrate it; Jev's probabilities
+    # are not calibrated to your traffic.
+    jev_escalation_threshold: float | None = None
+
     # Model catalog — path to models.yaml. Empty = repo-root models.yaml.
     catalog_path: str = ""
 

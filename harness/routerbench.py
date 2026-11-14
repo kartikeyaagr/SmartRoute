@@ -44,6 +44,9 @@ DEFAULT_LADDER = {
     "middle": "mistralai/mixtral-8x7b-chat",
     "frontier": "gpt-4-1106-preview",
 }
+# Derived from the Jev tutorial's sample response (476 input tokens -> $0.000019992),
+# NOT from the live model page. Pass --jev-price-per-mtok to use the current price.
+JEV_PRICE_PER_MTOK = 0.042
 _SAFE_MODULES = frozenset({"pandas", "numpy", "builtins", "copyreg", "_codecs"})
 
 
@@ -139,7 +142,11 @@ def _group(eval_name: str) -> str:
     return eval_name
 
 
-def evaluate(df, ladder: dict[str, str], triage_kind: str, lambda_wrong: float | None, decompose_as: str) -> dict:
+def evaluate(
+    df, ladder: dict[str, str], triage_kind: str, lambda_wrong: float | None, decompose_as: str,
+    jev_price_per_mtok: float = JEV_PRICE_PER_MTOK, live_n: int = 0,
+    decision_model: str = "~typesafe/jev-latest", concurrency: int = 8, seed: int = 42,
+) -> dict:
     from smartroute.decision import DecisionLayer
 
     texts = df["text"].tolist()
@@ -185,7 +192,16 @@ def evaluate(df, ladder: dict[str, str], triage_kind: str, lambda_wrong: float |
             "by_group": per_group.round(6).to_dict(orient="index"),
         }
 
+    routed_tiers = arms["routed"]
+    escalation_sim = simulate_escalation(df, ladder, routed_tiers, jev_price_per_mtok)
+    escalation_live = (
+        live_escalation(df, ladder, routed_tiers, live_n, decision_model, concurrency, seed)
+        if live_n else None
+    )
+
     return {
+        "escalation_sim": escalation_sim,
+        "escalation_live": escalation_live,
         "n": len(df),
         "ladder": ladder,
         "triage": triage.backend(),
@@ -196,6 +212,145 @@ def evaluate(df, ladder: dict[str, str], triage_kind: str, lambda_wrong: float |
         "decompose_scored_as": decompose_as,
         "arms": results,
     }
+
+
+# ---------------------------------------------------------------------------
+# Escalation: Jev checks the middle answer, frontier answers when it fails
+# ---------------------------------------------------------------------------
+
+_WRONG_BELOW = 0.5  # RouterBench scores are 0..1; some evals grade fractionally
+
+
+def _jev_cost(df, ladder, price_per_mtok):
+    resp = df[f"{ladder['middle']}|model_response"].fillna("").astype(str)
+    tokens = (df["text"].str.len() + resp.str.len()) / 4.0
+    return tokens * price_per_mtok / 1_000_000
+
+
+def _escalated_arm(df, ladder, tiers, escalate, jev_cost):
+    """Accuracy/cost when middle rows in `escalate` are re-answered by frontier."""
+    mid, front = ladder["middle"], ladder["frontier"]
+    scores, costs = [], []
+    for i, t in enumerate(tiers):
+        s = float(df.at[i, ladder[t]])
+        c = float(df.at[i, f"{ladder[t]}|total_cost"])
+        if t == "middle":
+            e = escalate[i]
+            s = (1 - e) * s + e * float(df.at[i, front])
+            c = c + float(jev_cost.iat[i]) + e * float(df.at[i, f"{front}|total_cost"])
+        scores.append(s)
+        costs.append(c)
+    return sum(scores) / len(scores), sum(costs) / len(costs)
+
+
+def simulate_escalation(df, ladder, tiers, price_per_mtok) -> dict:
+    """
+    How good does the checker have to be? Sweep detection rate (P(escalate | middle
+    wrong)) against false-alarm rate (P(escalate | middle right)). The perfect checker
+    (1.0, 0.0) is the ceiling any real Jev threshold can reach.
+    """
+    jev = _jev_cost(df, ladder, price_per_mtok)
+    wrong = [float(df.at[i, ladder["middle"]]) < _WRONG_BELOW for i in range(len(df))]
+    grid = {}
+    for detect in (1.0, 0.9, 0.8, 0.7, 0.5):
+        for false_alarm in (0.0, 0.1, 0.2, 0.3, 0.5):
+            esc = [detect if w else false_alarm for w in wrong]
+            acc, cost = _escalated_arm(df, ladder, tiers, esc, jev)
+            grid[f"{detect:.1f}/{false_alarm:.1f}"] = {"accuracy": acc, "cost_per_query": cost}
+    middle_rows = [i for i, t in enumerate(tiers) if t == "middle"]
+    return {
+        "jev_price_per_mtok": price_per_mtok,
+        "jev_cost_per_check": float(jev.iloc[middle_rows].mean()) if middle_rows else 0.0,
+        "middle_wrong_rate": (sum(wrong[i] for i in middle_rows) / len(middle_rows)) if middle_rows else 0.0,
+        "grid": grid,
+    }
+
+
+async def _live_checks(df, ladder, rows, model, concurrency):
+    import asyncio
+    import os
+
+    from smartroute.escalation import JevVerifier
+
+    verifier = JevVerifier(os.environ.get("OPENROUTER_API_KEY", ""), threshold=0.5, model=model)
+    sem = asyncio.Semaphore(concurrency)
+    col = f"{ladder['middle']}|model_response"
+
+    async def one(i):
+        async with sem:
+            r = await verifier.check(df.at[i, "text"], str(df.at[i, col] or ""))
+            return i, r.p_correct, r.cost_usd
+
+    return await asyncio.gather(*(one(i) for i in rows))
+
+
+def live_escalation(df, ladder, tiers, n, model, concurrency, seed) -> dict:
+    """Real Jev calls on recorded middle answers. Costs money; needs OPENROUTER_API_KEY."""
+    import asyncio
+    import random
+
+    middle_rows = [i for i, t in enumerate(tiers) if t == "middle"]
+    rows = sorted(random.Random(seed).sample(middle_rows, min(n, len(middle_rows))))
+    checks = asyncio.run(_live_checks(df, ladder, rows, model, concurrency))
+    ok = [(i, p, c) for i, p, c in checks if p is not None]
+    if not ok:
+        raise SystemExit("every Jev check failed — is OPENROUTER_API_KEY set?")
+
+    mid, front = ladder["middle"], ladder["frontier"]
+    sub = df.loc[[i for i, _, _ in ok]].reset_index(drop=True)
+    sub_tiers = ["middle"] * len(sub)
+    jev = __import__("pandas").Series([c for _, _, c in ok])  # actual billed cost
+    wrong = [float(sub.at[j, mid]) < _WRONG_BELOW for j in range(len(sub))]
+    probs = [p for _, p, _ in ok]
+
+    base_acc = float(sub[mid].mean())
+    base_cost = float(sub[f"{mid}|total_cost"].mean())
+    sweep = {}
+    for th in (0.3, 0.5, 0.6, 0.7, 0.78, 0.85, 0.9, 0.95):
+        esc = [1.0 if p < th else 0.0 for p in probs]
+        acc, cost = _escalated_arm(sub, ladder, sub_tiers, esc, jev)
+        n_wrong = sum(wrong) or 1
+        n_right = (len(wrong) - sum(wrong)) or 1
+        sweep[f"{th:.2f}"] = {
+            "accuracy": acc,
+            "cost_per_query": cost,
+            "escalation_rate": sum(esc) / len(esc),
+            "detection_rate": sum(e for e, w in zip(esc, wrong) if w) / n_wrong,
+            "false_alarm_rate": sum(e for e, w in zip(esc, wrong) if not w) / n_right,
+        }
+    return {
+        "n_checked": len(ok),
+        "n_failed": len(checks) - len(ok),
+        "jev_cost_per_check": float(jev.mean()),
+        "middle_accuracy": base_acc,
+        "middle_cost_per_query": base_cost,
+        "frontier_accuracy": float(sub[front].mean()),
+        "frontier_cost_per_query": float(sub[f"{front}|total_cost"].mean()),
+        "threshold_sweep": sweep,
+    }
+
+
+def render_escalation(r: dict) -> None:
+    sim = r.get("escalation_sim")
+    if sim:
+        print(f"\nEscalation ceiling (simulated checker) — middle wrong on "
+              f"{sim['middle_wrong_rate']:.1%} of middle-routed prompts; "
+              f"Jev ≈ ${sim['jev_cost_per_check']:.6f}/check at ${sim['jev_price_per_mtok']}/M (estimate)")
+        base = r["arms"]["routed"]
+        print(f"routed (no escalation): {base['accuracy']:.1%} @ ${base['cost_per_query']:.6f}")
+        print(f"{'detect/false-alarm':<20}{'accuracy':>10}{'$/query':>12}")
+        for k, v in sim["grid"].items():
+            print(f"{k:<20}{v['accuracy']:>10.1%}{v['cost_per_query']:>12.6f}")
+    live = r.get("escalation_live")
+    if live:
+        print(f"\nLive Jev checks — n={live['n_checked']} (failed {live['n_failed']}), "
+              f"${live['jev_cost_per_check']:.6f}/check")
+        print(f"same rows: middle {live['middle_accuracy']:.1%} @ ${live['middle_cost_per_query']:.6f}, "
+              f"frontier {live['frontier_accuracy']:.1%} @ ${live['frontier_cost_per_query']:.6f}")
+        print(f"{'threshold':<11}{'accuracy':>10}{'$/query':>12}{'escalate':>10}{'detect':>8}{'false+':>8}")
+        for th, v in live["threshold_sweep"].items():
+            print(f"{th:<11}{v['accuracy']:>10.1%}{v['cost_per_query']:>12.6f}"
+                  f"{v['escalation_rate']:>10.1%}{v['detection_rate']:>8.1%}{v['false_alarm_rate']:>8.1%}")
 
 
 def render(r: dict) -> None:
@@ -233,13 +388,25 @@ def main() -> None:
     ap.add_argument("--middle", default=DEFAULT_LADDER["middle"])
     ap.add_argument("--frontier", default=DEFAULT_LADDER["frontier"])
     ap.add_argument("--decompose-as", choices=("cheap", "middle", "frontier"), default="frontier")
+    ap.add_argument("--jev-price-per-mtok", type=float, default=JEV_PRICE_PER_MTOK,
+                    help="Jev input price for the simulated checker (default: tutorial-derived estimate)")
+    ap.add_argument("--jev-verify", type=int, default=0, metavar="N",
+                    help="also run N live Jev checks on recorded middle answers (costs money; "
+                         "needs OPENROUTER_API_KEY)")
+    ap.add_argument("--decision-model", default="~typesafe/jev-latest")
+    ap.add_argument("--concurrency", type=int, default=8)
     ap.add_argument("--out", type=Path, default=_REPO_ROOT / "harness" / "results" / "routerbench.json")
     args = ap.parse_args()
 
     ladder = {"cheap": args.cheap, "middle": args.middle, "frontier": args.frontier}
     df = load(args.data, args.n, args.seed)
-    result = evaluate(df, ladder, args.triage, args.lambda_wrong, args.decompose_as)
+    result = evaluate(
+        df, ladder, args.triage, args.lambda_wrong, args.decompose_as,
+        jev_price_per_mtok=args.jev_price_per_mtok, live_n=args.jev_verify,
+        decision_model=args.decision_model, concurrency=args.concurrency, seed=args.seed,
+    )
     render(result)
+    render_escalation(result)
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps(result, indent=2, default=float))
     print(f"\nwrote {args.out}")

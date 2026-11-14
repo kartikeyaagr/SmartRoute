@@ -31,6 +31,7 @@ from smartroute.verifier import CascadeVerifier
 if TYPE_CHECKING:
     from smartroute.decision import DecisionLayer
     from smartroute.decomposer import Decomposer
+    from smartroute.escalation import JevVerifier
     from smartroute.taskroute import TaskRanker
 
 logger = logging.getLogger(__name__)
@@ -75,6 +76,10 @@ class RoutingDecision:
     effort_confidence: float | None = None
     cost_tier_cap: str | None = None       # budget | standard | premium | frontier
     decision_cost_usd: float = 0.0         # Decisions API call; included in estimated_cost_usd
+
+    # Jev escalation of middle answers (dispatch="decision", JEV_ESCALATION=true)
+    escalation_p_correct: float | None = None  # Jev P(middle answer correct)
+    escalation_cost_usd: float = 0.0           # Jev check cost; included in estimated_cost_usd
 
 
 def _hash_prompt(messages: list[dict]) -> str:
@@ -121,6 +126,8 @@ class Router:
         decision_layer: "DecisionLayer | None" = None,
         decomposer: "Decomposer | None" = None,
         task_ranker: "TaskRanker | None" = None,
+        escalator: "JevVerifier | None" = None,
+        jev_escalation: bool | None = None,
     ) -> None:
         dispatch = dispatch or settings.dispatch
         if dispatch not in ("decision", "cascade", "taskrank"):
@@ -131,6 +138,12 @@ class Router:
         self._decision_layer = decision_layer
         self._decomposer = decomposer
         self._task_ranker = task_ranker
+        self._escalator = escalator
+        # An injected escalator turns the check on; otherwise the setting decides.
+        self._jev_escalation = (
+            jev_escalation if jev_escalation is not None
+            else (escalator is not None or settings.jev_escalation)
+        )
         self._catalog = catalog or get_catalog()
         self._classifier = classifier or get_classifier(settings.classifier)
         self._verifier = verifier or CascadeVerifier()
@@ -177,6 +190,57 @@ class Router:
                 config=TaskRouteConfig(decision_model=settings.decision_model),
             )
         return self._task_ranker
+
+    @property
+    def escalator(self) -> "JevVerifier":
+        if self._escalator is None:
+            from smartroute.escalation import JevVerifier, derived_threshold
+
+            frontier = self._catalog.by_role("frontier")
+            threshold = settings.jev_escalation_threshold
+            if threshold is None:
+                # Priced at the decision layer's assumed answer shape (128 in / 300 out).
+                threshold = derived_threshold(
+                    frontier.cost(128, 300), self._catalog.lambda_wrong_answer_usd
+                )
+            self._escalator = JevVerifier(
+                api_key=settings.openrouter_api_key,
+                threshold=threshold,
+                model=settings.decision_model,
+            )
+        return self._escalator
+
+    async def _maybe_escalate(
+        self, prompt_text: str, content: str, messages: list[dict],
+        decision: RoutingDecision, params: dict,
+    ) -> str:
+        """Jev-check a middle answer; replace it with a frontier answer if it fails."""
+        from smartroute.taskroute import TaskRouteError
+
+        try:
+            verifier = self.escalator
+        except TaskRouteError as exc:
+            logger.warning("Jev escalation unavailable: %s", exc)
+            return content
+
+        result = await verifier.check(prompt_text, content)
+        decision.escalation_p_correct = result.p_correct
+        decision.escalation_cost_usd = result.cost_usd
+        decision.estimated_cost_usd += result.cost_usd
+        decision.gate_reason = f"{decision.gate_reason} | {result.reason}"
+        if not result.escalate:
+            return content
+
+        decision.cheap_response = content
+        decision.escalated = True
+        try:
+            return await self._call_tier("frontier", messages, decision, params)
+        except ProviderError as exc:
+            # A flagged answer is still better than none.
+            logger.warning("frontier escalation failed: %s — returning middle answer", exc)
+            decision.final_model = decision.cascade_path[0] if decision.cascade_path else ""
+            decision.gate_reason += f" | frontier failed ({exc}); kept middle"
+            return content
 
     async def route_async(
         self,
@@ -296,6 +360,10 @@ class Router:
                 decision.escalated = result.route == "bailout-frontier"
             else:
                 content = await self._call_tier(route.path, messages, decision, params or {})
+                if route.path == "middle" and self._jev_escalation:
+                    content = await self._maybe_escalate(
+                        prompt_text, content, messages, decision, params or {}
+                    )
         except Exception as exc:
             decision.error = str(exc)
             decision.latency_ms = (time.perf_counter() - t0) * 1000
