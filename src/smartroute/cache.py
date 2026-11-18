@@ -4,6 +4,7 @@ Pluggable prompt cache for SmartRoute.
 Cache backends:
   NoOpCache        — always misses; default when CACHE_BACKEND=none
   InMemoryLRUCache — exact-match LRU; CACHE_BACKEND=memory
+  RedisCache       — exact-match, shared across replicas; CACHE_BACKEND=redis
   PgvectorCache    — semantic similarity via pgvector + sentence-transformers; CACHE_BACKEND=pgvector
 
 Usage in Router:
@@ -40,6 +41,11 @@ class PromptCache(Protocol):
         ...
 
 
+def exact_key(prompt: str) -> str:
+    """SHA-256 of the normalized prompt — the key every exact-match backend shares."""
+    return hashlib.sha256(prompt.strip().lower().encode()).hexdigest()
+
+
 class NoOpCache:
     """Always misses. Default when CACHE_BACKEND=none — zero behavior change."""
 
@@ -67,13 +73,8 @@ class InMemoryLRUCache:
         self._ttl = ttl_seconds
         self._store: OrderedDict[str, tuple[str, float]] = OrderedDict()  # key → (response, timestamp)
 
-    def _key(self, prompt: str) -> str:
-        normalized = prompt.strip().lower()
-        return hashlib.sha256(normalized.encode()).hexdigest()
-
     async def get(self, prompt: str) -> CacheHit | None:
-        import time
-        key = self._key(prompt)
+        key = exact_key(prompt)
         if key not in self._store:
             return None
 
@@ -87,8 +88,7 @@ class InMemoryLRUCache:
         return CacheHit(response=response, similarity=1.0)
 
     async def put(self, prompt: str, response: str) -> None:
-        import time
-        key = self._key(prompt)
+        key = exact_key(prompt)
 
         if key in self._store:
             self._store.move_to_end(key)
@@ -97,6 +97,42 @@ class InMemoryLRUCache:
         # Evict oldest entries beyond max_size
         while len(self._store) > self._max_size:
             self._store.popitem(last=False)
+
+
+class RedisCache:
+    """
+    Exact-match cache in Redis, shared by every replica.
+
+    InMemoryLRUCache lives inside one process, so with N pods behind a load balancer
+    each pod has its own cache and the hit rate drops ~N-fold. Redis is the one
+    place they all read and write. Eviction is Redis's job (TTL via SET EX, plus
+    `maxmemory-policy allkeys-lru` on the server), so there is no max_size here.
+
+    Same failure contract as PgvectorCache: a Redis outage degrades to a miss,
+    never to a failed request.
+    """
+
+    def __init__(self, url: str, ttl_seconds: float = 3600.0, client=None) -> None:
+        if client is None:
+            import redis.asyncio as redis  # [server] extra
+
+            client = redis.from_url(url, decode_responses=True, socket_timeout=0.5)
+        self._redis = client
+        self._ttl = max(1, int(ttl_seconds))
+
+    async def get(self, prompt: str) -> CacheHit | None:
+        try:
+            response = await self._redis.get("sr:" + exact_key(prompt))
+        except Exception as exc:
+            logger.warning("RedisCache.get failed: %s", exc)
+            return None
+        return CacheHit(response=response, similarity=1.0) if response is not None else None
+
+    async def put(self, prompt: str, response: str) -> None:
+        try:
+            await self._redis.set("sr:" + exact_key(prompt), response, ex=self._ttl)
+        except Exception as exc:
+            logger.warning("RedisCache.put failed: %s", exc)
 
 
 class PgvectorCache:
@@ -216,6 +252,8 @@ def get_cache(backend: str, **kwargs) -> PromptCache:
         return InMemoryLRUCache(**kwargs)
     if backend == "none":
         return NoOpCache()
+    if backend == "redis":
+        return RedisCache(**kwargs)
     if backend == "pgvector":
         return PgvectorCache(**kwargs)
-    raise ValueError(f"Unknown cache backend: {backend!r}. Valid options: 'none', 'memory', 'pgvector'")
+    raise ValueError(f"Unknown cache backend: {backend!r}. Valid options: 'none', 'memory', 'redis', 'pgvector'")

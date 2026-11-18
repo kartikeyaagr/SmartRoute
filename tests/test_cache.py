@@ -106,7 +106,7 @@ def test_get_cache_pgvector_returns_pgvector():
 
 def test_get_cache_unknown_raises():
     with pytest.raises(ValueError, match="Unknown cache backend"):
-        get_cache("redis")
+        get_cache("memcached")
 
 
 def test_prompt_cache_protocol():
@@ -315,3 +315,48 @@ async def test_router_writes_to_cache_after_llm_call():
 
     assert content2 == "Paris"
     assert decision2.cache_hit is True
+
+
+# ---------------------------------------------------------------------------
+# RedisCache — fakeredis, no server needed
+# ---------------------------------------------------------------------------
+
+async def test_redis_cache_shared_across_instances():
+    """Two RedisCache objects on one server = two pods sharing one cache."""
+    import fakeredis
+    from smartroute.cache import RedisCache
+
+    server = fakeredis.FakeServer()
+    pod_a = RedisCache("", client=fakeredis.FakeAsyncRedis(server=server, decode_responses=True))
+    pod_b = RedisCache("", client=fakeredis.FakeAsyncRedis(server=server, decode_responses=True))
+
+    assert await pod_b.get("What is 2+2?") is None
+    await pod_a.put("What is 2+2?", "4")
+    hit = await pod_b.get("  what is 2+2?  ")  # same normalization as the memory cache
+    assert hit == CacheHit(response="4", similarity=1.0)
+
+
+async def test_redis_cache_sets_ttl():
+    import fakeredis
+    from smartroute.cache import RedisCache, exact_key
+
+    client = fakeredis.FakeAsyncRedis(decode_responses=True)
+    await RedisCache("", ttl_seconds=60, client=client).put("p", "r")
+    assert 0 < await client.ttl("sr:" + exact_key("p")) <= 60
+
+
+async def test_redis_outage_degrades_to_miss():
+    from smartroute.cache import RedisCache
+
+    down = MagicMock()
+    down.get = AsyncMock(side_effect=ConnectionError("refused"))
+    down.set = AsyncMock(side_effect=ConnectionError("refused"))
+    cache = RedisCache("", client=down)
+    await cache.put("p", "r")  # must not raise
+    assert await cache.get("p") is None
+
+
+def test_get_cache_redis():
+    from smartroute.cache import RedisCache
+
+    assert isinstance(get_cache("redis", url="redis://localhost:6379/0"), RedisCache)

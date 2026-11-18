@@ -1,0 +1,17 @@
+# GKE Autopilot overrides: helm upgrade --install smartroute deploy/helm/smartroute \
+#   -f deploy/helm/values-gke.yaml --set image.tag=$SHA --set-file catalog=models.yaml
+image:
+  # Artifact Registry repo created by deploy/terraform (output: image_repository)
+  repository: REGION-docker.pkg.dev/PROJECT_ID/smartroute/smartroute
+  pullPolicy: IfNotPresent
+
+ingress:
+  enabled: true
+  annotations:
+    kubernetes.io/ingress.class: gce
+    # Static IP reserved by Terraform (output: ingress_ip_name)
+    kubernetes.io/ingress.global-static-ip-name: smartroute-ip
+
+postgres:
+  storage: 10Gi
+  # Pass at deploy time from a CI secret: --set postgres.password=$PG_PASSWORD

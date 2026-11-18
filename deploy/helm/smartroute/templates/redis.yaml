@@ -1,0 +1,37 @@
+{{- if .Values.redis.enabled }}
+# Single replica, no persistence: it's a cache. Losing it costs hit rate, not data.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-redis
+  labels: {{- include "smartroute.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {{- include "smartroute.selector" (dict "Release" .Release "component" "redis") | nindent 6 }}
+  template:
+    metadata:
+      labels: {{- include "smartroute.selector" (dict "Release" .Release "component" "redis") | nindent 8 }}
+    spec:
+      containers:
+        - name: redis
+          image: {{ .Values.redis.image }}
+          args: ["--save", "", "--maxmemory", "{{ .Values.redis.maxmemory }}", "--maxmemory-policy", "allkeys-lru"]
+          ports:
+            - {name: redis, containerPort: 6379}
+          readinessProbe:
+            exec: {command: [redis-cli, ping]}
+          resources:
+            requests: {cpu: 50m, memory: 300Mi}
+            limits: {memory: 300Mi}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}-redis
+  labels: {{- include "smartroute.labels" . | nindent 4 }}
+spec:
+  selector: {{- include "smartroute.selector" (dict "Release" .Release "component" "redis") | nindent 4 }}
+  ports:
+    - {name: redis, port: 6379, targetPort: redis}
+{{- end }}

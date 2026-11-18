@@ -74,6 +74,25 @@ def evaluate(triage_kind: str, lambda_wrong: float, n: int | None, corpus: Path 
     }
 
 
+def regressions(result: dict, baseline: dict, tolerance: float) -> list[str]:
+    """
+    What got worse than the committed baseline, beyond `tolerance` (absolute, 0-1).
+
+    Two numbers gate a merge: overall routing accuracy may not drop, and the safety
+    rate (hard work sent to the cheap tier) may not rise. Leakage is the one that
+    costs answer quality; accuracy alone would let a change trade safety for lookups.
+    """
+    found = []
+    if result["overall_routed_right"] < baseline["overall_routed_right"] - tolerance:
+        found.append(f"routing accuracy {result['overall_routed_right']:.1%} < baseline "
+                     f"{baseline['overall_routed_right']:.1%}")
+    for name, rate in result["cheap_leakage"].items():
+        base = baseline["cheap_leakage"].get(name, 0.0)
+        if rate > base + tolerance:
+            found.append(f"want-{name} sent to cheap {rate:.1%} > baseline {base:.1%}")
+    return found
+
+
 def render(result: dict) -> None:
     print(f"\ntriage={result['triage']}  lambda=${result['lambda_wrong_usd']:.4f}  "
           f"lookup>={result['lookup_threshold']} (needs precision "
@@ -102,6 +121,12 @@ def main() -> None:
     ap.add_argument("--corpus", type=Path, default=None, help="corpus JSONL (default: the synthetic 200)")
     ap.add_argument("--compare", action="store_true", help="run both triage backends")
     ap.add_argument("--json", type=Path, help="also write results as JSON")
+    ap.add_argument("--baseline", type=Path,
+                    help="CI gate: exit 1 if results regress against this baseline JSON")
+    ap.add_argument("--tolerance", type=float, default=0.02,
+                    help="allowed absolute slack vs baseline (default 0.02 = 2 points)")
+    ap.add_argument("--update-baseline", action="store_true",
+                    help="overwrite --baseline with these results instead of gating")
     args = ap.parse_args()
 
     kinds = ["heuristic", "embedding"] if args.compare else [args.triage]
@@ -122,6 +147,23 @@ def main() -> None:
         args.json.parent.mkdir(parents=True, exist_ok=True)
         args.json.write_text(json.dumps(results, indent=2))
         print(f"\nwrote {args.json}")
+
+    if args.baseline:
+        keep = ("overall_routed_right", "cheap_leakage")
+        current = {r["triage"]: {k: r[k] for k in keep} for r in results}
+        if args.update_baseline:
+            args.baseline.write_text(json.dumps(current, indent=2, sort_keys=True) + "\n")
+            print(f"\nbaseline updated: {args.baseline}")
+            return
+        baseline = json.loads(args.baseline.read_text())
+        failed = [f"[{name}] no baseline for this triage; run with --update-baseline"
+                  for name in current if name not in baseline]
+        failed += [f"[{name}] {msg}" for name, r in current.items() if name in baseline
+                   for msg in regressions(r, baseline[name], args.tolerance)]
+        if failed:
+            print("\nROUTING REGRESSION:\n  " + "\n  ".join(failed))
+            raise SystemExit(1)
+        print(f"\nrouting gate passed (tolerance {args.tolerance:.0%})")
 
 
 if __name__ == "__main__":

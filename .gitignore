@@ -30,3 +30,9 @@ harness/results/*.md
 
 # graft's local graph cache — regenerable, not committed (run `graft build`).
 /graft/
+
+# Terraform: local state/plugins and real variable values (the .lock.hcl IS committed)
+.terraform/
+*.tfstate
+*.tfstate.*
+terraform.tfvars

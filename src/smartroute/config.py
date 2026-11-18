@@ -66,10 +66,11 @@ class Settings(BaseSettings):
     verifier_timeout_s: float = 30.0
 
     # Cache (v0.2)
-    cache_backend: str = "none"  # "none" | "memory" | "pgvector"
+    cache_backend: str = "none"  # "none" | "memory" | "redis" | "pgvector"
     cache_similarity_threshold: float = 0.95  # reserved for pgvector semantic cache
     cache_ttl_seconds: float = 3600.0  # 1 hour default
     cache_max_size: int = 1000  # max entries for in-memory LRU cache
+    redis_url: str = "redis://localhost:6379/0"  # CACHE_BACKEND=redis
 
     # Database — leave empty to run without Postgres (JSONL logging only)
     database_url: str = ""
@@ -81,6 +82,18 @@ class Settings(BaseSettings):
     # When set, all /v1/* requests must carry `Authorization: Bearer <key>`.
     # Leave empty to run unauthenticated (local dev only).
     server_api_key: str = ""
+    # Tracing → Langfuse (observability._exporter). Ignored when
+    # OTEL_EXPORTER_OTLP_ENDPOINT is set. trace_content=True also sends prompts and
+    # completions to the tracing backend — off by default, they may contain user data.
+    langfuse_public_key: str = ""
+    langfuse_secret_key: str = ""
+    langfuse_base_url: str = "https://cloud.langfuse.com"
+    trace_content: bool = False
+
+    # Input guardrail (guardrail.py): "block" rejects with 400, "log" only counts
+    # (smartroute_guardrail_total) so you can measure false positives, "off" skips it.
+    guardrail: str = "block"
+    guardrail_max_chars: int = 100_000
 
 
 settings = Settings()

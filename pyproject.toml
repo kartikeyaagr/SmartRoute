@@ -35,7 +35,8 @@ server = [
     "python-json-logger>=2.0",
     "opentelemetry-sdk>=1.25",
     "opentelemetry-instrumentation-fastapi>=0.46b0",
-    "opentelemetry-exporter-otlp-proto-grpc>=1.25",
+    "redis>=5.0",
+    "opentelemetry-exporter-otlp-proto-http>=1.25",
 ]
 
 # CLI entry point for the API server (requires [server] extra)
@@ -44,6 +45,7 @@ smartroute-server = "smartroute.server:main"
 
 [dependency-groups]
 dev = [
+    "fakeredis>=2.40.0",
     "httpx>=0.28.1",
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
@@ -68,3 +70,14 @@ markers = [
     "integration: requires real API keys (skipped by default)",
     "real_triage: loads the real sentence-transformers encoder (slow)",
 ]
+
+# Linux (CI runners, the Docker image) gets CPU-only torch: the default PyPI wheel
+# bundles CUDA (~2.5GB) and nothing here runs on a GPU — MiniLM triage is CPU work.
+# macOS is unaffected (PyPI's macOS wheels are already CPU/MPS-only).
+[tool.uv.sources]
+torch = [{ index = "pytorch-cpu", marker = "sys_platform == 'linux'" }]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true

@@ -25,6 +25,7 @@ from sse_starlette.sse import EventSourceResponse
 from smartroute import db as _db
 from smartroute import observability as _obs
 from smartroute.config import settings
+from smartroute.guardrail import check_input
 from smartroute.providers import ProviderError
 from smartroute.router import Router
 
@@ -181,6 +182,17 @@ async def metrics() -> Response:
 
 @app.post("/v1/chat/completions", dependencies=[Security(_require_auth)])
 async def chat_completions(body: ChatCompletionRequest) -> JSONResponse:
+    if settings.guardrail != "off":
+        reason = check_input(body.messages, settings.guardrail_max_chars)
+        if reason:
+            _obs.GUARDRAIL_TOTAL.labels(reason=reason, mode=settings.guardrail).inc()
+            if settings.guardrail == "block":
+                return JSONResponse(
+                    status_code=400,
+                    content={"error": {"message": f"blocked by guardrail: {reason}",
+                                       "type": "guardrail", "code": reason}},
+                )
+
     tracer = _obs.get_tracer()
     with tracer.start_as_current_span("smartroute.route") as span:
         router: Router = app.state.router

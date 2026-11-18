@@ -15,6 +15,13 @@ services:
       timeout: 3s
       retries: 5
 
+  redis:
+    image: redis:7-alpine
+    # Cache only: no persistence, evict least-recently-used keys when full.
+    command: ["redis-server", "--save", "", "--maxmemory", "256mb", "--maxmemory-policy", "allkeys-lru"]
+    ports:
+      - "6379:6379"
+
   smartroute:
     build: .
     ports:
@@ -25,7 +32,11 @@ services:
       SERVER_HOST: "0.0.0.0"
       SERVER_PORT: "8000"
       DATABASE_URL: "postgresql://smartroute:smartroute@postgres:5432/smartroute"
+      CACHE_BACKEND: "redis"
+      REDIS_URL: "redis://redis:6379/0"
     depends_on:
+      redis:
+        condition: service_started
       postgres:
         condition: service_healthy
 

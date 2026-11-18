@@ -1,0 +1,79 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}
+  labels: {{- include "smartroute.labels" . | nindent 4 }}
+spec:
+  {{- if not .Values.autoscaling.enabled }}
+  replicas: {{ .Values.replicas }}
+  {{- end }}
+  selector:
+    matchLabels: {{- include "smartroute.selector" (dict "Release" .Release "component" "api") | nindent 6 }}
+  template:
+    metadata:
+      labels: {{- include "smartroute.selector" (dict "Release" .Release "component" "api") | nindent 8 }}
+      annotations:
+        # Roll pods when the catalog changes (a ConfigMap edit alone doesn't restart them).
+        checksum/catalog: {{ .Values.catalog | sha256sum }}
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+        prometheus.io/path: /metrics
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+      {{- if .Values.postgres.enabled }}
+      # The server opens its DB pool at startup and exits if Postgres isn't up yet.
+      # Waiting here turns a crash-loop on first install into a clean ordered start.
+      initContainers:
+        - name: wait-for-postgres
+          image: {{ .Values.postgres.image }}
+          command: [sh, -c, "until pg_isready -h {{ .Release.Name }}-postgres -U smartroute; do sleep 2; done"]
+      {{- end }}
+      containers:
+        - name: api
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - {name: http, containerPort: 8000}
+          envFrom:
+            - secretRef:
+                name: {{ .Values.existingSecret }}
+                optional: true   # lets the chart boot (health, guardrail) with no keys at all
+          env:
+            {{- range $k, $v := .Values.env }}
+            - {name: {{ $k }}, value: {{ $v | quote }}}
+            {{- end }}
+            {{- if .Values.catalog }}
+            - {name: CATALOG_PATH, value: /etc/smartroute/models.yaml}
+            {{- end }}
+            {{- if .Values.redis.enabled }}
+            - {name: REDIS_URL, value: "redis://{{ .Release.Name }}-redis:6379/0"}
+            {{- end }}
+            {{- if .Values.postgres.enabled }}
+            - name: PGPASSWORD
+              valueFrom: {secretKeyRef: {name: {{ .Release.Name }}-postgres, key: password}}
+            # $(PGPASSWORD) is expanded by Kubernetes from the var defined just above.
+            - {name: DATABASE_URL, value: "postgresql://smartroute:$(PGPASSWORD)@{{ .Release.Name }}-postgres:5432/smartroute"}
+            {{- end }}
+          readinessProbe:
+            httpGet: {path: /health, port: http}
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: {path: /health, port: http}
+            periodSeconds: 10
+            failureThreshold: 6
+          startupProbe:   # torch import + catalog load: give startup its own budget
+            httpGet: {path: /health, port: http}
+            periodSeconds: 5
+            failureThreshold: 24
+          resources: {{- toYaml .Values.resources | nindent 12 }}
+          {{- if .Values.catalog }}
+          volumeMounts:
+            - {name: catalog, mountPath: /etc/smartroute, readOnly: true}
+          {{- end }}
+      {{- if .Values.catalog }}
+      volumes:
+        - name: catalog
+          configMap: {name: {{ .Release.Name }}-catalog}
+      {{- end }}

@@ -1,0 +1,9 @@
+{
+  "embedding": {
+    "cheap_leakage": {
+      "decompose": 0.0,
+      "middle": 0.016666666666666666
+    },
+    "overall_routed_right": 0.84
+  }
+}

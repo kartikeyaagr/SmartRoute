@@ -1,0 +1,58 @@
+# Defaults target a local k3s/k3d/kind cluster. Cloud overrides live in ../values-gke.yaml.
+
+image:
+  repository: ghcr.io/kartikeyaagr/smartroute
+  tag: latest          # CI deploys pass --set image.tag=<git sha>; never deploy :latest for real
+  pullPolicy: IfNotPresent
+
+replicas: 2
+
+# Name of a Secret holding provider keys and other sensitive env vars
+# (TOGETHERAI_API_KEY, ANTHROPIC_API_KEY, SERVER_API_KEY, LANGFUSE_*...).
+# Created outside the chart so keys never land in values files or Helm history:
+#   kubectl create secret generic smartroute-keys --from-env-file=.env
+existingSecret: smartroute-keys
+
+# Non-secret settings, passed straight through as env vars (see .env.example).
+env:
+  DISPATCH: decision
+  CACHE_BACKEND: redis
+  GUARDRAIL: block
+  LOG_LEVEL: INFO
+
+# Model catalog. Install with: --set-file catalog=models.yaml
+# Empty = the models.yaml baked into the image.
+catalog: ""
+
+resources:
+  # MiniLM triage + torch keeps ~600Mi resident; requests are what the scheduler
+  # (and GKE Autopilot's bill) uses, so keep them honest.
+  requests: {cpu: 250m, memory: 1Gi}
+  limits: {memory: 1536Mi}
+
+autoscaling:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 6
+  targetCPUUtilizationPercentage: 70
+
+service:
+  port: 80
+
+ingress:
+  enabled: false
+  className: ""
+  host: ""
+  annotations: {}
+
+redis:
+  enabled: true
+  image: redis:7-alpine
+  maxmemory: 256mb
+
+postgres:
+  enabled: true
+  image: pgvector/pgvector:pg17
+  storage: 5Gi
+  # Local default only. Override on any shared cluster: --set postgres.password=...
+  password: smartroute

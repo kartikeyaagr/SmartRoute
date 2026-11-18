@@ -92,6 +92,8 @@ def _cache_kwargs(backend: str) -> dict:
     base = {"ttl_seconds": settings.cache_ttl_seconds}
     if backend == "memory":
         base["max_size"] = settings.cache_max_size
+    if backend == "redis":
+        base["url"] = settings.redis_url
     if backend == "pgvector":
         base["similarity_threshold"] = settings.cache_similarity_threshold
     return base

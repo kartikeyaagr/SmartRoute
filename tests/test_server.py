@@ -42,6 +42,8 @@ def client():
 def authed_client(monkeypatch):
     monkeypatch.setattr("smartroute.server.settings", MagicMock(
         server_api_key="test-key",
+        guardrail="block",
+        guardrail_max_chars=100_000,
         server_host="0.0.0.0",
         server_port=8000,
     ))

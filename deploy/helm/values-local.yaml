@@ -1,0 +1,13 @@
+# Local k3d/kind/k3s and the CI smoke test: one replica, small disk, image loaded locally.
+image:
+  repository: smartroute
+  tag: ci
+  pullPolicy: Never
+autoscaling:
+  enabled: false
+replicas: 1
+resources:
+  requests: {cpu: 100m, memory: 512Mi}
+  limits: {memory: 2Gi}
+postgres:
+  storage: 1Gi

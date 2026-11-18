@@ -16,8 +16,10 @@ from the catalog logs a WARNING so a stale catalog price surfaces instead of rot
 """
 
 import asyncio
+import json
 import logging
 import time
+from contextlib import nullcontext
 from dataclasses import dataclass
 
 from typing import TYPE_CHECKING
@@ -29,6 +31,11 @@ if TYPE_CHECKING:
     from smartroute.catalog import ModelSpec
 
 logger = logging.getLogger(__name__)
+
+try:
+    from opentelemetry import trace as _trace
+except ImportError:  # [server] extra not installed: the library runs untraced
+    _trace = None
 
 _PRICE_DIVERGENCE_TOLERANCE = 0.05  # warn when catalog and registry disagree by >5%
 
@@ -72,6 +79,39 @@ class ModelResponse:
 
 
 async def call_model(
+    model: str,
+    messages: list[dict],
+    timeout_s: float | None = None,
+    spec: "ModelSpec | None" = None,
+    **params,
+) -> ModelResponse:
+    """
+    _call_model inside an OTel span that Langfuse renders as a "generation":
+    model, tokens and cost for every call — cheap, middle, frontier, judge alike.
+    Nested under the server's `smartroute.route` span, so one request = one trace.
+    Failures are recorded on the span (exception + ERROR status) by OTel itself.
+    """
+    span_cm = _trace.get_tracer("smartroute").start_as_current_span(f"llm {model}") if _trace else nullcontext()
+    with span_cm as span:
+        r = await _call_model(model, messages, timeout_s, spec, **params)
+        if span is not None and span.is_recording():
+            span.set_attributes({
+                "langfuse.observation.type": "generation",
+                "langfuse.observation.model.name": model,
+                "langfuse.observation.usage_details": json.dumps(
+                    {"input": r.input_tokens, "output": r.output_tokens}),
+                "langfuse.observation.cost_details": json.dumps({"total": r.estimated_cost_usd}),
+                "gen_ai.request.model": model,
+                "gen_ai.usage.input_tokens": r.input_tokens,
+                "gen_ai.usage.output_tokens": r.output_tokens,
+            })
+            if settings.trace_content:
+                span.set_attribute("langfuse.observation.input", json.dumps(messages))
+                span.set_attribute("langfuse.observation.output", r.content)
+        return r
+
+
+async def _call_model(
     model: str,
     messages: list[dict],
     timeout_s: float | None = None,

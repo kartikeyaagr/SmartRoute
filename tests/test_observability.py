@@ -116,3 +116,60 @@ def test_configure_logging_sets_json_formatter():
     root = logging.getLogger()
     assert root.level == logging.WARNING
     assert any(h.formatter is not None for h in root.handlers)
+
+
+# ---------------------------------------------------------------------------
+# Tracing: generation spans + Langfuse exporter config
+# ---------------------------------------------------------------------------
+
+async def test_call_model_emits_generation_span(monkeypatch):
+    """Every model call becomes a span Langfuse renders as a generation."""
+    import json
+    from types import SimpleNamespace
+
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+
+    from smartroute import providers
+    from tests.conftest import CHEAP_ID
+
+    exporter = InMemorySpanExporter()
+    tp = TracerProvider()
+    tp.add_span_processor(SimpleSpanProcessor(exporter))
+    monkeypatch.setattr(providers, "_trace", SimpleNamespace(get_tracer=tp.get_tracer))
+
+    fake = MagicMock()
+    fake.usage = SimpleNamespace(prompt_tokens=12, completion_tokens=3)
+    fake.choices = [SimpleNamespace(message=SimpleNamespace(content="hi"))]
+    with patch("litellm.acompletion", new=AsyncMock(return_value=fake)):
+        r = await providers.call_model(CHEAP_ID, [{"role": "user", "content": "x"}])
+
+    (span,) = exporter.get_finished_spans()
+    a = span.attributes
+    assert a["langfuse.observation.type"] == "generation"
+    assert a["langfuse.observation.model.name"] == CHEAP_ID
+    assert json.loads(a["langfuse.observation.usage_details"]) == {"input": 12, "output": 3}
+    assert json.loads(a["langfuse.observation.cost_details"])["total"] == r.estimated_cost_usd
+    assert "langfuse.observation.input" not in a  # content capture is opt-in
+
+
+def test_langfuse_keys_build_otlp_http_exporter(monkeypatch):
+    from smartroute import observability
+
+    monkeypatch.delenv("OTEL_EXPORTER_OTLP_ENDPOINT", raising=False)
+    monkeypatch.setattr("smartroute.config.settings.langfuse_public_key", "pk-lf-1")
+    monkeypatch.setattr("smartroute.config.settings.langfuse_secret_key", "sk-lf-2")
+    with patch("opentelemetry.exporter.otlp.proto.http.trace_exporter.OTLPSpanExporter") as exp:
+        observability._exporter()
+    kwargs = exp.call_args.kwargs
+    assert kwargs["endpoint"] == "https://cloud.langfuse.com/api/public/otel/v1/traces"
+    assert kwargs["headers"]["Authorization"] == "Basic cGstbGYtMTpzay1sZi0y"  # b64("pk-lf-1:sk-lf-2")
+
+
+def test_no_tracing_config_means_no_exporter(monkeypatch):
+    from smartroute import observability
+
+    monkeypatch.delenv("OTEL_EXPORTER_OTLP_ENDPOINT", raising=False)
+    monkeypatch.setattr("smartroute.config.settings.langfuse_public_key", "")
+    assert observability._exporter() is None

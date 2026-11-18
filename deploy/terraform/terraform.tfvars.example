@@ -1,0 +1,3 @@
+# cp terraform.tfvars.example terraform.tfvars  (terraform.tfvars is gitignored)
+project_id = "my-gcp-project"
+region     = "us-central1"

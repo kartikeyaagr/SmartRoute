@@ -1,0 +1,10 @@
+{{- if .Values.catalog }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Release.Name }}-catalog
+  labels: {{- include "smartroute.labels" . | nindent 4 }}
+data:
+  models.yaml: |
+    {{- .Values.catalog | nindent 4 }}
+{{- end }}
