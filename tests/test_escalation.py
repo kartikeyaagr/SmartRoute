@@ -160,7 +160,7 @@ class TestLearnedAndEnsemble:
         class Fixed:
             def __init__(self, p, cost):
                 self.p, self.cost = p, cost
-            async def check(self, prompt, response):
+            async def check(self, prompt, response, messages=None):
                 return VerifyResult(self.p, False, self.cost, f"p={self.p}")
         r = await EnsembleVerifier([Fixed(0.9, 0.00003), Fixed(0.3, 0.0)], threshold=0.7).check("q", "a")
         assert r.p_correct == pytest.approx(0.6) and r.escalate is True
@@ -172,7 +172,7 @@ class TestLearnedAndEnsemble:
         class Fixed:
             def __init__(self, p):
                 self.p = p
-            async def check(self, prompt, response):
+            async def check(self, prompt, response, messages=None):
                 return VerifyResult(self.p, False, 0.0, "")
         r = await EnsembleVerifier([Fixed(None), Fixed(0.9)], threshold=0.7).check("q", "a")
         assert r.p_correct == 0.9 and r.escalate is False

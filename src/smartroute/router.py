@@ -203,23 +203,40 @@ class Router:
                 threshold = derived_threshold(
                     frontier.cost(128, 300), self._catalog.lambda_wrong_answer_usd
                 )
-            self._escalator = build_checker(settings.escalation_checker, threshold)
+            self._escalator = build_checker(settings.escalation_checker, threshold, sampler=self._sample_tier)
         return self._escalator
+
+    async def _sample_tier(self, messages: list[dict], n: int) -> list[tuple[str, float]]:
+        """n independent answers from the self-consistency source tier, in parallel."""
+        spec = self._catalog.by_role(settings.sc_source)
+
+        async def one():
+            resp = await call_model(
+                spec.id, messages, timeout_s=settings.model_timeout_s, spec=spec,
+                temperature=settings.sc_temperature,
+            )
+            return resp.content, resp.estimated_cost_usd
+
+        results = await asyncio.gather(*(one() for _ in range(n)), return_exceptions=True)
+        ok = [r for r in results if not isinstance(r, BaseException)]
+        if not ok:
+            raise ProviderError(f"all {n} self-consistency samples failed: {results[0]}")
+        return ok
 
     async def _maybe_escalate(
         self, prompt_text: str, content: str, messages: list[dict],
         decision: RoutingDecision, params: dict,
     ) -> str:
-        """Jev-check a middle answer; replace it with a frontier answer if it fails."""
+        """Check a middle answer; replace it with a frontier answer if the check fails."""
         from smartroute.taskroute import TaskRouteError
 
         try:
             verifier = self.escalator
         except TaskRouteError as exc:
-            logger.warning("Jev escalation unavailable: %s", exc)
+            logger.warning("escalation checker unavailable: %s", exc)
             return content
 
-        result = await verifier.check(prompt_text, content)
+        result = await verifier.check(prompt_text, content, messages)
         decision.escalation_p_correct = result.p_correct
         decision.escalation_cost_usd = result.cost_usd
         decision.estimated_cost_usd += result.cost_usd
@@ -609,29 +626,40 @@ class Router:
             return future.result()
 
 
-def build_checker(kind: str, threshold: float):
-    """jev | learned | both. `both` averages whichever checkers could be built."""
-    from smartroute.escalation import EnsembleVerifier, JevVerifier, LearnedVerifier
+def build_checker(kind: str, threshold: float, sampler=None):
+    """
+    Comma-separated checker names: jev, learned, consistency. Several -> mean P(correct)
+    of whichever could be built. `both` is kept as an alias for `jev,learned`.
+    """
+    from smartroute.escalation import (
+        EnsembleVerifier, JevVerifier, LearnedVerifier, SelfConsistencyVerifier,
+    )
     from smartroute.taskroute import TaskRouteError
 
-    def jev():
-        return JevVerifier(settings.openrouter_api_key, threshold=threshold, model=settings.decision_model)
+    def consistency():
+        if sampler is None:
+            raise TaskRouteError("self-consistency needs a sampler")
+        return SelfConsistencyVerifier(sampler, threshold=threshold,
+                                       samples=settings.sc_samples, source=settings.sc_source)
 
-    def learned():
-        return LearnedVerifier(threshold=threshold)
-
-    if kind == "jev":
-        return jev()
-    if kind == "learned":
-        return learned()
-    if kind != "both":
-        raise ValueError(f"ESCALATION_CHECKER must be jev, learned or both, got {kind!r}")
+    makers = {
+        "jev": lambda: JevVerifier(settings.openrouter_api_key, threshold=threshold,
+                                   model=settings.decision_model),
+        "learned": lambda: LearnedVerifier(threshold=threshold),
+        "consistency": consistency,
+    }
+    names = ["jev", "learned"] if kind == "both" else [k.strip() for k in kind.split(",") if k.strip()]
+    unknown = [n for n in names if n not in makers]
+    if unknown or not names:
+        raise ValueError(f"ESCALATION_CHECKER entries must be from {sorted(makers)}, got {kind!r}")
+    if len(names) == 1:
+        return makers[names[0]]()  # a single named checker fails loudly
     built = []
-    for make in (jev, learned):
+    for name in names:
         try:
-            built.append(make())
+            built.append(makers[name]())
         except TaskRouteError as exc:
-            logger.warning("checker unavailable: %s", exc)
+            logger.warning("checker %s unavailable: %s", name, exc)
     if not built:
         raise TaskRouteError("no escalation checker could be built")
     return built[0] if len(built) == 1 else EnsembleVerifier(built, threshold)

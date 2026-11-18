@@ -30,9 +30,15 @@ class Settings(BaseSettings):
     # 1 - frontier_cost / lambda_wrong_answer_usd. Calibrate it; Jev's probabilities
     # are not calibrated to your traffic.
     jev_escalation_threshold: float | None = None
-    # Which checker scores middle answers: "jev" | "learned" | "both" (mean P(correct)).
-    # "learned" needs src/smartroute/data/checker.joblib (harness/train_checker.py).
+    # Which checker(s) score middle answers, comma-separated: jev, learned, consistency.
+    # Several -> mean P(correct). "both" = "jev,learned". "learned" needs
+    # src/smartroute/data/checker.joblib (harness/train_checker.py).
     escalation_checker: str = "jev"
+    # Self-consistency: extra samples drawn and compared with the middle answer.
+    # sc_source "middle" = true self-consistency; "cheap" = cross-model agreement (cheaper).
+    sc_samples: int = 2
+    sc_source: str = "middle"
+    sc_temperature: float = 0.7
 
     # Model catalog — path to models.yaml. Empty = repo-root models.yaml.
     catalog_path: str = ""

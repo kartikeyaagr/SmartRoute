@@ -147,6 +147,10 @@ With the default two-layer dispatch, every middle-tier answer can be checked by 
 
 A classifier over MiniLM embeddings of (prompt, answer) that predicts P(correct), trained by `harness/train_checker.py` on graded answers — ideally your own middle model's, as JSONL `{"prompt", "response", "correct"}`. `both` averages it with Jev. It costs no API call; it is only as good as the match between its training answers and the model it checks.
 
+### self-consistency checker (`ESCALATION_CHECKER=consistency`)
+
+Re-asks `SC_SAMPLES` times (default 2, `SC_TEMPERATURE=0.7`) and uses the share of samples that agree with the middle answer as P(correct). Answers are compared by extracted letter (multiple choice), final number, or token F1 for free text and code. `SC_SOURCE=middle` resamples the same model (true self-consistency); `SC_SOURCE=cheap` samples the cheap tier instead (cross-model agreement, cheaper). Sample costs are added to `estimated_cost_usd`. `ESCALATION_CHECKER` takes a comma list (`learned,consistency`, `jev,consistency`, ...); several checkers are averaged.
+
 ### RouterBench replay
 
 `harness/routerbench.py` replays the two-layer decision router over [RouterBench](https://huggingface.co/datasets/withmartian/routerbench) (36,497 prompts with recorded score and cost for 11 models). Each tier maps to a RouterBench model, so the run calls no models and costs nothing:

@@ -37,6 +37,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -101,7 +103,7 @@ class JevVerifier:
             api_key, TaskRouteConfig(decision_model=model, timeout_s=timeout_s), client=client
         )
 
-    async def check(self, prompt: str, response: str) -> VerifyResult:
+    async def check(self, prompt: str, response: str, messages: list[dict] | None = None) -> VerifyResult:
         if not response.strip():
             return VerifyResult(p_correct=0.0, escalate=True, cost_usd=0.0, reason="empty middle answer")
         try:
@@ -183,7 +185,7 @@ class LearnedVerifier:
         )
         return float(self._head.predict_proba(pair_features(e[:1], e[1:2]))[0][1])
 
-    async def check(self, prompt: str, response: str) -> VerifyResult:
+    async def check(self, prompt: str, response: str, messages: list[dict] | None = None) -> VerifyResult:
         if not response.strip():
             return VerifyResult(p_correct=0.0, escalate=True, cost_usd=0.0, reason="empty middle answer")
         try:
@@ -203,8 +205,8 @@ class EnsembleVerifier:
         self._verifiers = verifiers
         self.threshold = threshold
 
-    async def check(self, prompt: str, response: str) -> VerifyResult:
-        results = await asyncio.gather(*(v.check(prompt, response) for v in self._verifiers))
+    async def check(self, prompt: str, response: str, messages: list[dict] | None = None) -> VerifyResult:
+        results = await asyncio.gather(*(v.check(prompt, response, messages) for v in self._verifiers))
         cost = sum(r.cost_usd for r in results)
         ps = [r.p_correct for r in results if r.p_correct is not None]
         if not ps:
@@ -214,3 +216,104 @@ class EnsembleVerifier:
         parts = ", ".join(r.reason for r in results)
         return VerifyResult(p, escalate, cost,
                             f"ensemble p_correct={p:.2f} {'<' if escalate else '>='} {self.threshold:.2f} [{parts}]")
+
+
+# ---------------------------------------------------------------------------
+# Self-consistency: re-ask, and escalate when the answers disagree
+# ---------------------------------------------------------------------------
+#
+# A model that knows the answer tends to give it again; one that is guessing scatters.
+# So sample k more answers and use the share that agree with the original as
+# P(correct). Unlike the learned checker it needs no training data, and unlike Jev it
+# does not have to solve the question itself — it only has to compare answers.
+#
+# It costs k extra calls. Two sources:
+#   middle  true self-consistency: k samples of the same model at temperature > 0
+#   cheap   cross-model agreement: k samples of the cheap tier — cheaper, and the only
+#           variant RouterBench can replay (it records one answer per model)
+
+_LETTER = re.compile(
+    r"(?i:answer(?: is)?|option|choice)\s*[:\-]?\s*\(?([A-Ea-e])\)?(?![A-Za-z])"
+    r"|\[([A-E])\]"
+    # a bare letter on its own line, or "B." / "(B)" / "B)" — but not "A man ..."
+    r"|^\s*\(?([A-E])(?:\)|\.|:)?\s*$"
+    r"|^\s*\(?([A-E])[).:]",
+    re.MULTILINE,
+)
+_GSM_FINAL = re.compile(r"####\s*(-?[\d,]*\.?\d+)")
+_NUMBER = re.compile(r"-?\d[\d,]*\.?\d*")
+_WORD = re.compile(r"[a-z0-9]+")
+
+
+def extract_answer(text: str) -> tuple[str, str]:
+    """(kind, value): ("letter", "B") | ("number", "42") | ("text", "normalised words")."""
+    t = (text or "").strip()
+    if "```" in t or re.search(r"^\s*(def|class|import|function)\s", t, re.MULTILINE):
+        return "text", " ".join(_WORD.findall(t.lower()))  # code: compare as text, not by its last number
+    m = _LETTER.search(t[:400])
+    if m:
+        return "letter", next(g for g in m.groups() if g).upper()
+    m = _GSM_FINAL.search(t)
+    nums = [m.group(1)] if m else _NUMBER.findall(t)
+    if nums and len(t) < 2000:
+        n = nums[-1].replace(",", "").rstrip(".")
+        try:
+            return "number", f"{float(n):g}"
+        except ValueError:
+            pass
+    return "text", " ".join(_WORD.findall(t.lower()))
+
+
+def _token_f1(a: str, b: str) -> float:
+    ta, tb = a.split(), b.split()
+    if not ta or not tb:
+        return float(ta == tb)
+    common = sum(min(ta.count(w), tb.count(w)) for w in set(ta))
+    if common == 0:
+        return 0.0
+    p, r = common / len(ta), common / len(tb)
+    return 2 * p * r / (p + r)
+
+
+def answers_agree(a: str, b: str, text_f1: float = 0.6) -> bool:
+    """Same extracted letter/number, or free text with token F1 >= text_f1."""
+    ka, va = extract_answer(a)
+    kb, vb = extract_answer(b)
+    if ka != "text" and kb != "text":
+        return ka == kb and va == vb
+    if ka != "text" or kb != "text":
+        return False  # one gave a definite letter/number, the other did not
+    return _token_f1(va, vb) >= text_f1
+
+
+# (messages, n) -> list of (answer text, cost in USD)
+Sampler = Callable[[list[dict], int], Awaitable[list[tuple[str, float]]]]
+
+
+class SelfConsistencyVerifier:
+    def __init__(self, sampler: Sampler, threshold: float, samples: int = 2, source: str = "middle") -> None:
+        if samples < 1:
+            raise ValueError("self-consistency needs at least one extra sample")
+        self._sample = sampler
+        self.threshold = threshold
+        self.samples = samples
+        self.source = source
+
+    async def check(self, prompt: str, response: str, messages: list[dict] | None = None) -> VerifyResult:
+        if not response.strip():
+            return VerifyResult(0.0, True, 0.0, "empty middle answer")
+        msgs = messages or [{"role": "user", "content": prompt}]
+        try:
+            drawn = await self._sample(msgs, self.samples)
+        except Exception as exc:
+            logger.warning("self-consistency sampling failed: %s — keeping middle answer", exc)
+            return VerifyResult(None, False, 0.0, f"self-consistency failed ({exc}); kept middle")
+        cost = sum(c for _, c in drawn)
+        answers = [a for a, _ in drawn if a.strip()]
+        if not answers:
+            return VerifyResult(None, False, cost, "self-consistency got no samples; kept middle")
+        p = sum(answers_agree(response, a) for a in answers) / len(answers)
+        escalate = p < self.threshold
+        return VerifyResult(p, escalate, cost,
+                            f"consistency[{self.source} x{len(answers)}] agree={p:.2f} "
+                            f"{'<' if escalate else '>='} {self.threshold:.2f}")

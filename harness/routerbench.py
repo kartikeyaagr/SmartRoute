@@ -26,8 +26,14 @@ Routers compared
 
 AIQ = mean height of a router's non-decreasing convex hull of (cost, accuracy) points
 over the ladder's cost range [always-cheap, always-frontier]. Every router may fall back
-to always-cheap/always-frontier, so AIQ(router) >= AIQ(zero ladder) by construction:
-equal means the router adds nothing over picking a fixed model.
+to always-cheap/always-frontier, and every checker can be switched off, so
+AIQ(decision+checker) >= AIQ(decision) by construction: equal means the checker adds
+nothing. The decision router itself can score below zero (ladder) if its routed points
+sit under the ladder hull.
+
+Consistency checkers compare the middle answer with other models' *recorded* answers
+(RouterBench has one answer per model, so same-model resampling cannot be replayed),
+and pay those models' recorded cost on every middle-routed prompt.
 
 What this does NOT measure
 --------------------------
@@ -256,6 +262,13 @@ def cost_to_reach(grid, vals, target) -> float | None:
 # Evaluation
 # ---------------------------------------------------------------------------
 
+def default_peers(df, ladder, k: int = 2) -> list[str]:
+    """The k non-ladder models whose mean cost is closest to the middle model's."""
+    mid_cost = df[f"{ladder['middle']}|total_cost"].mean()
+    others = [m for m in ALL_MODELS if m not in ladder.values()]
+    return sorted(others, key=lambda m: abs(df[f"{m}|total_cost"].mean() - mid_cost))[:k]
+
+
 def evaluate(df, ladder, args) -> dict:
     from sklearn.metrics import roc_auc_score
 
@@ -305,6 +318,36 @@ def evaluate(df, ladder, args) -> dict:
         first.setdefault(t, i)
     triage = PrecomputedTriage(list(first), P[list(first.values())], args.triage)
 
+    # -- consistency checkers: agreement with other models' recorded answers ----
+    # RouterBench has one answer per model, so true self-resampling cannot be
+    # replayed. Cross-model agreement is the replayable proxy, and is SC_SOURCE=cheap
+    # in production when the peer is the cheap tier.
+    from smartroute.escalation import answers_agree
+
+    test_rows = np.nonzero(test)[0]
+    mid_answers = [_user_text(str(df.at[i, resp_col])) for i in test_rows]
+    peers = args.sc_peers or default_peers(df, ladder)
+
+    def agreement(models):
+        votes = np.zeros(len(test_rows))
+        cost = np.zeros(len(test_rows))
+        for m in models:
+            col = df[f"{m}|model_response"]
+            votes += [answers_agree(a, _user_text(str(col.iat[i]))) for a, i in zip(mid_answers, test_rows)]
+            cost += df[f"{m}|total_cost"].to_numpy(float)[test_rows]
+        return votes / len(models), cost
+
+    print(f"scoring agreement with {peers} and {ladder['cheap']} ...", flush=True)
+    p_peers, cost_peers = agreement(peers)
+    p_cheap, cost_cheap = agreement([ladder["cheap"]])
+    checkers = {
+        "learned": (p_correct, np.zeros(len(test_rows))),
+        "consistency[cheap]": (p_cheap, cost_cheap),
+        "consistency[peers]": (p_peers, cost_peers),
+        "learned+consistency[peers]": ((p_correct + p_peers) / 2, cost_peers),
+    }
+    checker_auc = {name: float(roc_auc_score(~wrong_t, p)) for name, (p, _) in checkers.items()}
+
     def tiers_for(lmbda) -> tuple[np.ndarray, collections.Counter, DecisionLayer]:
         layer = DecisionLayer(triage=triage, lambda_wrong_usd=lmbda)
         paths = [layer.decide(t).path for t in Pt]
@@ -317,7 +360,8 @@ def evaluate(df, ladder, args) -> dict:
         if escalate is not None:
             m = (idx == 1) & escalate
             s[m] = St[m, 2]
-            c[idx == 1] += 0.0 if extra_cost is None else extra_cost[idx == 1]
+            if extra_cost is not None:
+                c[idx == 1] += extra_cost[idx == 1]
             c[m] += Ct[m, 2]
         return float(s.mean()), float(c.mean()), s
 
@@ -330,7 +374,7 @@ def evaluate(df, ladder, args) -> dict:
         "zero (ladder)": [(c, a) for a, c in fixed.values()],
         "zero (all 11)": all11,
         "decision": list(endpoints),
-        "decision+learned": list(endpoints),
+        **{f"decision+{name}": list(endpoints) for name in checkers},
         "decision+perfect": list(endpoints),
     }
     sweep = []
@@ -339,15 +383,21 @@ def evaluate(df, ladder, args) -> dict:
         idx, counts, layer = tiers_for(lmbda)
         acc, cost, s_route = point(idx)
         curves["decision"].append((cost, acc))
+        # The checker can always be switched off, so its curve includes this point.
+        for name in checkers:
+            curves[f"decision+{name}"].append((cost, acc))
+        curves["decision+perfect"].append((cost, acc))
         pa, pc, _ = point(idx, escalate=wrong_t)
         curves["decision+perfect"].append((pc, pa))
         row = {"lambda": layer._lambda, "paths": dict(counts), "accuracy": acc, "cost": cost,
-               "perfect": {"accuracy": pa, "cost": pc}, "learned": {}}
-        for th in THRESHOLDS:
-            la, lc, _ = point(idx, escalate=p_correct < th)
-            curves["decision+learned"].append((lc, la))
-            row["learned"][f"{th:.2f}"] = {"accuracy": la, "cost": lc,
-                                          "escalation_rate": float((p_correct[idx == 1] < th).mean())}
+               "perfect": {"accuracy": pa, "cost": pc}, "checkers": {}}
+        for name, (p, extra) in checkers.items():
+            row["checkers"][name] = {}
+            for th in THRESHOLDS:
+                ca, cc, _ = point(idx, escalate=p < th, extra_cost=extra)
+                curves[f"decision+{name}"].append((cc, ca))
+                row["checkers"][name][f"{th:.2f}"] = {
+                    "accuracy": ca, "cost": cc, "escalation_rate": float((p[idx == 1] < th).mean())}
         sweep.append(row)
         if lmbda is None:
             catalog = (idx, counts, layer, s_route)
@@ -363,14 +413,15 @@ def evaluate(df, ladder, args) -> dict:
     idx, counts, layer, s_route = catalog
     arms = {f"always-{t}": {"accuracy": a, "cost": c} for t, (a, c) in fixed.items()}
     arms["routed"] = {"accuracy": sweep[0]["accuracy"], "cost": sweep[0]["cost"]}
-    # Headline checker threshold: most accurate setting that costs at most half of
-    # always-frontier. Chosen on the test split, so it flatters slightly; the AIQ and
-    # the full sweep are the threshold-free numbers.
-    learned = sweep[0]["learned"]
-    affordable = [k for k, v in learned.items() if v["cost"] <= 0.5 * fixed["frontier"][1]]
-    best_th = (max(affordable, key=lambda k: learned[k]["accuracy"]) if affordable
-               else min(learned, key=lambda k: learned[k]["cost"]))
-    arms[f"routed+learned@{best_th} (<=1/2 frontier $)"] = learned[best_th]
+    # Headline threshold per checker: most accurate setting costing at most half of
+    # always-frontier. Chosen on the test split, so it flatters slightly; AIQ and the
+    # full sweep are the threshold-free numbers.
+    for name in checkers:
+        table = sweep[0]["checkers"][name]
+        affordable = [k for k, v in table.items() if v["cost"] <= 0.5 * fixed["frontier"][1]]
+        best = (max(affordable, key=lambda k: table[k]["accuracy"]) if affordable
+                else min(table, key=lambda k: table[k]["cost"]))
+        arms[f"routed+{name}@{best}"] = table[best]
     arms["routed+perfect checker"] = sweep[0]["perfect"]
     oracle_idx = np.where(St[:, 0] > 0, 0, np.where(St[:, 1] > 0, 1, np.where(St[:, 2] > 0, 2, 0)))
     oa, oc, _ = point(oracle_idx)
@@ -387,14 +438,14 @@ def evaluate(df, ladder, args) -> dict:
     for detect in (1.0, 0.9, 0.8, 0.7, 0.5):
         for fa in (0.0, 0.1, 0.2, 0.3):
             esc_p = np.where(wrong_t, detect, fa)
-            s = St[np.arange(len(idx)), idx].copy()
-            c = Ct[np.arange(len(idx)), idx].copy()
+            s_ = St[np.arange(len(idx)), idx].copy()
+            c_ = Ct[np.arange(len(idx)), idx].copy()
             mm = idx == 1
-            s[mm] = (1 - esc_p[mm]) * s[mm] + esc_p[mm] * St[mm, 2]
-            c[mm] += jev_t[mm] + esc_p[mm] * Ct[mm, 2]
-            sim[f"{detect:.1f}/{fa:.1f}"] = {"accuracy": float(s.mean()), "cost": float(c.mean())}
+            s_[mm] = (1 - esc_p[mm]) * s_[mm] + esc_p[mm] * St[mm, 2]
+            c_[mm] += jev_t[mm] + esc_p[mm] * Ct[mm, 2]
+            sim[f"{detect:.1f}/{fa:.1f}"] = {"accuracy": float(s_.mean()), "cost": float(c_.mean())}
 
-    live = live_escalation(df, ladder, np.nonzero(test)[0][idx == 1], args) if args.jev_verify else None
+    live = live_escalation(df, ladder, test_rows[idx == 1], args) if args.jev_verify else None
 
     return {
         "data": args.data.name, "n_total": len(df), "n_test": int(test.sum()), "ladder": ladder,
@@ -402,6 +453,7 @@ def evaluate(df, ladder, args) -> dict:
         "lookup_threshold": layer._lookup_threshold, "path_counts": dict(counts),
         "checker": {"kind": head_kind, "val_auc": val_auc, "test_auc": test_auc,
                     "middle_wrong_rate_test": float(wrong_t.mean())},
+        "checker_auc": checker_auc, "sc_peers": peers,
         "arms": arms, "by_group": by_group, "aiq": aiqs, "cost_range": [lo, hi],
         "cost_to_95pct_frontier": reach, "frontier_accuracy": fixed["frontier"][0],
         "lambda_sweep": sweep, "jev_sim": sim, "jev_live": live,
@@ -469,13 +521,15 @@ def render(r: dict) -> None:
     print("ladder: " + " -> ".join(f"{k}={v}" for k, v in r["ladder"].items()))
     print("paths @ catalog lambda: " + ", ".join(f"{k}={v}" for k, v in sorted(r["path_counts"].items())))
     ck = r["checker"]
-    print(f"learned checker: {ck['kind']}, test AUC {ck['test_auc']:.3f} "
-          f"(middle wrong on {ck['middle_wrong_rate_test']:.1%} of test prompts)\n")
+    print(f"middle wrong on {ck['middle_wrong_rate_test']:.1%} of test prompts; "
+          f"consistency peers: {', '.join(r['sc_peers'])}")
+    print("checker test AUC: " + ", ".join(f"{k} {v:.3f}" for k, v in r["checker_auc"].items())
+          + f"  (learned = {ck['kind']})\n")
 
     base = r["arms"]["always-cheap"]["cost"]
-    print(f"{'arm':<40}{'accuracy':>10}{'$/query':>12}{'vs cheap':>10}")
+    print(f"{'arm':<46}{'accuracy':>10}{'$/query':>12}{'vs cheap':>10}")
     for name, a in r["arms"].items():
-        print(f"{name:<40}{a['accuracy']:>10.1%}{a['cost']:>12.6f}{a['cost'] / base:>9.2f}x")
+        print(f"{name:<46}{a['accuracy']:>10.1%}{a['cost']:>12.6f}{a['cost'] / base:>9.2f}x")
 
     lo, hi = r["cost_range"]
     print(f"\nAIQ over ${lo:.6f}..${hi:.6f}/query (higher is better); "
@@ -484,7 +538,7 @@ def render(r: dict) -> None:
     for name, v in r["aiq"].items():
         c = r["cost_to_95pct_frontier"][name]
         reach = f"${c:.6f} ({c / hi:.0%} of frontier)" if c is not None else "never"
-        print(f"  {name:<20} AIQ {v:.4f}  ({v - zero:+.4f} vs zero-ladder)   95%: {reach}")
+        print(f"  {name:<36} AIQ {v:.4f}  ({v - zero:+.4f} vs zero-ladder)   95%: {reach}")
 
     print(f"\n{'group':<22}{'n':>6}{'cheap':>8}{'middle':>8}{'front':>8}{'routed':>8}")
     for g, v in r["by_group"].items():
@@ -513,6 +567,9 @@ def main() -> None:
                     help="run N live Jev checks on test-split middle answers (costs money; OPENROUTER_API_KEY)")
     ap.add_argument("--decision-model", default="~typesafe/jev-latest")
     ap.add_argument("--concurrency", type=int, default=8)
+    ap.add_argument("--sc-peers", type=lambda v: [m.strip() for m in v.split(",") if m.strip()],
+                    default=None, help="models whose recorded answers the consistency checker compares "
+                                       "against (default: 2 non-ladder models priced nearest the middle)")
     ap.add_argument("--save-checker", type=Path, default=None, help="write the fitted checker (joblib)")
     ap.add_argument("--cache-dir", type=Path, default=_REPO_ROOT / "harness" / "results" / ".cache")
     ap.add_argument("--out", type=Path, default=_REPO_ROOT / "harness" / "results" / "routerbench.json")
