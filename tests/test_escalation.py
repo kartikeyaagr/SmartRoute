@@ -176,3 +176,30 @@ class TestLearnedAndEnsemble:
                 return VerifyResult(self.p, False, 0.0, "")
         r = await EnsembleVerifier([Fixed(None), Fixed(0.9)], threshold=0.7).check("q", "a")
         assert r.p_correct == 0.9 and r.escalate is False
+
+
+class TestTypeSafeProvider:
+    async def test_native_endpoint_model_name_and_token_pricing(self):
+        from smartroute.taskroute import TYPESAFE_BASE, TYPESAFE_PATH
+
+        calls = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls.append(request)
+            return httpx.Response(200, json={
+                "model": "jev-1.14.0",
+                "answers": {"answers_correctly": {"type": "noul", "noul": 0.01}},
+                "usage": {"input_tokens": 1_000_000, "output_tokens": 23},
+            })
+        client = httpx.AsyncClient(base_url=TYPESAFE_BASE, transport=httpx.MockTransport(handler))
+        v = JevVerifier("ts-key", threshold=0.5, client=client, provider="typesafe", price_per_mtok=0.04)
+        r = await v.check("2+2?", "5")
+        assert r.escalate is True and r.p_correct == 0.01
+        assert r.cost_usd == pytest.approx(0.04)                     # tokens x price, no usage.cost
+        assert calls[0].url.path == TYPESAFE_PATH
+        assert json.loads(calls[0].content)["model"] == "jev-latest"  # "~typesafe/" prefix stripped
+
+    def test_unknown_provider_rejected(self):
+        from smartroute.taskroute import DecisionsClient, TaskRouteConfig
+        with pytest.raises(ValueError):
+            DecisionsClient("k", TaskRouteConfig(), provider="nope")

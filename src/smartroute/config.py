@@ -17,6 +17,12 @@ class Settings(BaseSettings):
     groq_api_key: str = ""
     togetherai_api_key: str = ""
     openrouter_api_key: str = ""
+    # TypeSafe's own key for Jev (api.typesafe.ai). When set, Jev calls go there instead
+    # of through OpenRouter; task-ranked routing still needs OPENROUTER_API_KEY for the
+    # benchmarks/models data and for calling the chosen model.
+    typesafe_api_key: str = ""
+    # Jev input price for cost accounting on TypeSafe calls (its response has no cost).
+    jev_price_per_mtok: float = 0.04198
 
     # Router dispatch: "decision" (two-layer, default) | "cascade" | "taskrank"
     # taskrank = Decisions-API task + effort classification -> OpenRouter task rankings

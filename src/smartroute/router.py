@@ -643,8 +643,12 @@ def build_checker(kind: str, threshold: float, sampler=None):
                                        samples=settings.sc_samples, source=settings.sc_source)
 
     makers = {
-        "jev": lambda: JevVerifier(settings.openrouter_api_key, threshold=threshold,
-                                   model=settings.decision_model),
+        "jev": lambda: JevVerifier(
+            settings.typesafe_api_key or settings.openrouter_api_key, threshold=threshold,
+            model=settings.decision_model,
+            provider="typesafe" if settings.typesafe_api_key else "openrouter",
+            price_per_mtok=settings.jev_price_per_mtok,
+        ),
         "learned": lambda: LearnedVerifier(threshold=threshold),
         "consistency": consistency,
     }

@@ -137,7 +137,7 @@ An alternative dispatch that picks a model per prompt from OpenRouter's live dat
 3. **Cost-cap** — effort sets the highest allowed cost tier (budget ≤ $0.50/M, standard ≤ $2/M, premium ≤ $8/M, frontier open; blended 25% input / 75% output). Low effort confidence allows one tier higher.
 4. **Route** — the best-scoring survivor is called via `openrouter/<id>`; the next survivor on provider error. If selection itself fails, the request falls back to the catalog's default tier.
 
-Requires `OPENROUTER_API_KEY`. The Decisions call's cost is added to `estimated_cost_usd`. Benchmark composites are not your traffic — check with the harness. Tunables live in `TaskRouteConfig` (`src/smartroute/taskroute.py`).
+Requires `OPENROUTER_API_KEY`; set `TYPESAFE_API_KEY` too and the Jev call goes to TypeSafe's own API (`api.typesafe.ai/v1/systemone`) instead. The Decisions call's cost is added to `estimated_cost_usd`. Benchmark composites are not your traffic — check with the harness. Tunables live in `TaskRouteConfig` (`src/smartroute/taskroute.py`).
 
 ### Jev-verified escalation (`JEV_ESCALATION=true`)
 
@@ -157,8 +157,8 @@ Re-asks `SC_SAMPLES` times (default 2, `SC_TEMPERATURE=0.7`) and uses the share 
 
 ```bash
 uv run --extra ml --with pandas harness/routerbench.py --data routerbench_5shot.pkl
-# + live Jev checks of 500 recorded middle answers (needs OPENROUTER_API_KEY, costs money)
-uv run --extra ml --with pandas harness/routerbench.py --data routerbench_5shot.pkl --jev-verify 500
+# + Jev on every recorded middle answer (TYPESAFE_API_KEY or OPENROUTER_API_KEY; ~$0.00005/row)
+TYPESAFE_API_KEY=... uv run --extra ml --with pandas harness/routerbench.py --data routerbench_5shot.pkl --jev
 ```
 
 Prompts split 70/30; the learned checker trains on the 70% and everything is reported on the 30%. Each run sweeps the cost-of-a-wrong-answer setting and the checker threshold, and reports the paper's AIQ (area under the non-decreasing convex hull of cost vs accuracy) against the Zero router, plus the cost to reach 95% of frontier accuracy. Use the 5-shot file: its per-model scores match the RouterBench paper; the 0-shot file's do not.

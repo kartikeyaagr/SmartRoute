@@ -56,6 +56,20 @@ MODELS_PATH = "/api/v1/models"
 
 DEFAULT_DECISION_MODEL = "~typesafe/jev-latest"
 
+# TypeSafe's own endpoint for the same model and the same state/questions contract.
+TYPESAFE_BASE = "https://api.typesafe.ai"
+TYPESAFE_PATH = "/v1/systemone"
+# TypeSafe's response carries token counts but no cost. Priced at Jev 1.14's OpenRouter
+# list price ($0.04198/M input, output free, checked 2026-11-18); TypeSafe's direct
+# billing may differ — override with JEV_PRICE_PER_MTOK.
+JEV_PRICE_PER_MTOK = 0.04198
+
+
+def typesafe_model(model: str) -> str:
+    """OpenRouter slug -> TypeSafe model name: `~typesafe/jev-latest` -> `jev-latest`."""
+    name = model.lstrip("~")
+    return name.split("/", 1)[1] if name.startswith("typesafe/") else name
+
 # task bucket -> (Choice criterion, Artificial Analysis index field)
 TASK_TYPES: dict[str, tuple[str, str]] = {
     "coding": (
@@ -293,31 +307,57 @@ class OpenRouterData:
 
 
 class DecisionsClient:
-    """POST /api/alpha/decisions — typed answers with probabilities."""
+    """
+    Typed answers with probabilities, from either of two providers of the same model:
 
-    def __init__(self, api_key: str, config: TaskRouteConfig, client: httpx.AsyncClient | None = None):
+        openrouter  POST openrouter.ai/api/alpha/decisions   cost from usage.cost
+        typesafe    POST api.typesafe.ai/v1/systemone        cost = input_tokens x price
+    """
+
+    def __init__(
+        self,
+        api_key: str,
+        config: TaskRouteConfig,
+        client: httpx.AsyncClient | None = None,
+        provider: str = "openrouter",
+        price_per_mtok: float = JEV_PRICE_PER_MTOK,
+    ):
+        if provider not in ("openrouter", "typesafe"):
+            raise ValueError(f"decisions provider must be openrouter or typesafe, got {provider!r}")
         self._key = api_key
         self._cfg = config
         self._client = client
+        self.provider = provider
+        self._price = price_per_mtok
 
     def _http(self) -> httpx.AsyncClient:
         if self._client is None:
-            self._client = httpx.AsyncClient(base_url=OPENROUTER_BASE, timeout=self._cfg.timeout_s)
+            base = TYPESAFE_BASE if self.provider == "typesafe" else OPENROUTER_BASE
+            self._client = httpx.AsyncClient(base_url=base, timeout=self._cfg.timeout_s)
         return self._client
 
     async def decide(self, state: dict, questions: dict) -> tuple[dict, float]:
         """Returns (answers, cost_usd)."""
+        if self.provider == "typesafe":
+            path, model = TYPESAFE_PATH, typesafe_model(self._cfg.decision_model)
+        else:
+            path, model = DECISIONS_PATH, self._cfg.decision_model
         try:
             resp = await self._http().post(
-                DECISIONS_PATH,
+                path,
                 headers={"Authorization": f"Bearer {self._key}"},
-                json={"model": self._cfg.decision_model, "state": state, "questions": questions},
+                json={"model": model, "state": state, "questions": questions},
             )
             resp.raise_for_status()
         except httpx.HTTPError as exc:
-            raise TaskRouteError(f"decisions API call failed: {exc}") from exc
+            raise TaskRouteError(f"decisions API call failed ({self.provider}): {exc}") from exc
         body = resp.json()
-        return body.get("answers") or {}, float((body.get("usage") or {}).get("cost") or 0.0)
+        usage = body.get("usage") or {}
+        if usage.get("cost") is not None:
+            cost = float(usage["cost"])
+        else:
+            cost = float(usage.get("input_tokens") or 0) * self._price / 1_000_000
+        return body.get("answers") or {}, cost
 
 
 # ---------------------------------------------------------------------------
@@ -341,7 +381,7 @@ class TaskRanker:
             raise TaskRouteError("OPENROUTER_API_KEY is required for task-ranked routing")
         self.config = config or TaskRouteConfig()
         self._data = data or OpenRouterData(api_key, self.config)
-        self._decisions = decisions or DecisionsClient(api_key, self.config)
+        self._decisions = decisions or _default_decisions(api_key, self.config)
 
     # -- pricing -----------------------------------------------------------
 
@@ -482,3 +522,13 @@ class TaskRanker:
             reason=reason,
             rejected=rejected,
         )
+
+
+def _default_decisions(openrouter_key: str, config: TaskRouteConfig) -> DecisionsClient:
+    """TypeSafe directly when TYPESAFE_API_KEY is set, else Jev via OpenRouter."""
+    from smartroute.config import settings
+
+    if settings.typesafe_api_key:
+        return DecisionsClient(settings.typesafe_api_key, config, provider="typesafe",
+                               price_per_mtok=settings.jev_price_per_mtok)
+    return DecisionsClient(openrouter_key, config)

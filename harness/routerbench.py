@@ -12,8 +12,14 @@ and that model's recorded score and cost are read off. No model is called.
 
 Protocol (matches the paper's predictive-router setup)
 ------------------------------------------------------
-Prompts are split 70/30 at random. The learned checker trains on the 70%; every number
-reported — every arm, curve and AIQ — is on the held-out 30%.
+Prompts are split 70/30 at random, --splits times (default 5) with different seeds. The
+learned checker retrains on each 70%; every number is on that split's held-out 30%.
+Intervals are 95% CIs across splits with the Nadeau-Bengio correction for overlapping
+test sets; "vs" columns are paired differences within each split.
+
+--jev scores every middle answer once with Jev (TypeSafe's API when TYPESAFE_API_KEY is
+set, else OpenRouter), caches the scores, and reuses them across splits — Jev is not
+trained, so it needs no split of its own. Costs ~$0.00005 per row.
 
 Routers compared
 ----------------
@@ -80,9 +86,7 @@ ALL_MODELS = (
     "meta/llama-2-70b-chat", "mistralai/mistral-7b-chat", "mistralai/mixtral-8x7b-chat",
     "zero-one-ai/Yi-34B-Chat",
 )
-# Derived from the Jev tutorial's sample response (476 input tokens -> $0.000019992),
-# NOT from the live model page. Pass --jev-price-per-mtok to use the current price.
-JEV_PRICE_PER_MTOK = 0.042
+JEV_PRICE_PER_MTOK = 0.04198  # Jev 1.14 OpenRouter list price, input only (2026-11-18)
 LAMBDAS = (None, 1e-4, 3e-4, 1e-3, 3e-3, 1e-2, 3e-2, 1e-1)  # None = catalog value
 THRESHOLDS = tuple(round(x, 2) for x in np.arange(0.05, 1.0, 0.05))
 ENCODER = "all-MiniLM-L6-v2"
@@ -262,6 +266,87 @@ def cost_to_reach(grid, vals, target) -> float | None:
 # Evaluation
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Jev: scored once per row, cached, reused by every split
+# ---------------------------------------------------------------------------
+
+def jev_scores(df, ladder, rows, args) -> tuple[np.ndarray, np.ndarray, int]:
+    """
+    P(correct) and billed cost for the middle answer on `rows`. Jev is not trained, so
+    one score per (row, middle model) serves every split; results are cached on disk.
+    Failed checks get p=1.0 (no escalation), matching the production failure policy.
+    """
+    import asyncio
+    import os
+
+    from smartroute.escalation import JevVerifier
+
+    key = os.environ.get("TYPESAFE_API_KEY") or os.environ.get("OPENROUTER_API_KEY", "")
+    provider = "typesafe" if os.environ.get("TYPESAFE_API_KEY") else "openrouter"
+    col = f"{ladder['middle']}|model_response"
+    cache = args.cache_dir / f"jev-{provider}-{ladder['middle'].replace('/', '_')}.json"
+    done: dict[str, list] = json.loads(cache.read_text()) if cache.exists() else {}
+    ids = [str(df.at[i, "sample_id"]) for i in rows]
+    todo = [(i, sid) for i, sid in zip(rows, ids) if sid not in done]
+
+    if todo:
+        verifier = JevVerifier(key, threshold=0.5, model=args.decision_model, provider=provider,
+                               price_per_mtok=args.jev_price_per_mtok)
+        print(f"Jev via {provider}: {len(todo)} checks ({len(rows) - len(todo)} cached) ...", flush=True)
+
+        async def run():
+            sem = asyncio.Semaphore(args.concurrency)
+
+            async def one(i, sid):
+                async with sem:
+                    for attempt in range(4):
+                        r = await verifier.check(df.at[i, "text"], _user_text(str(df.at[i, col] or "")))
+                        if r.p_correct is not None:
+                            return sid, [r.p_correct, r.cost_usd]
+                        await asyncio.sleep(2 ** attempt)
+                    return sid, None
+            out = []
+            batch = 500
+            for start in range(0, len(todo), batch):
+                out += await asyncio.gather(*(one(i, sid) for i, sid in todo[start:start + batch]))
+                done.update({sid: v for sid, v in out[-batch:] if v is not None})
+                cache.parent.mkdir(parents=True, exist_ok=True)
+                cache.write_text(json.dumps(done))  # checkpoint: a crash keeps what was paid for
+                print(f"  {min(start + batch, len(todo))}/{len(todo)}", flush=True)
+            return out
+        asyncio.run(run())
+
+    p = np.array([done[sid][0] if sid in done else 1.0 for sid in ids])
+    cost = np.array([done[sid][1] if sid in done else 0.0 for sid in ids])
+    return p, cost, sum(sid not in done for sid in ids)
+
+
+# ---------------------------------------------------------------------------
+# Confidence intervals across random splits
+# ---------------------------------------------------------------------------
+
+def corrected_ci(values, n_train: int, n_test: int) -> dict:
+    """
+    95% CI from repeated random splits with the Nadeau-Bengio correction: test sets
+    overlap between splits, so the naive variance understates the uncertainty. The
+    corrected variance multiplies by (1/k + n_test/n_train) instead of 1/k.
+    """
+    from scipy import stats
+
+    v = np.asarray(values, dtype=float)
+    k = len(v)
+    mean = float(v.mean())
+    if k < 2:
+        return {"mean": mean, "lo": None, "hi": None, "k": k}
+    se = float(np.sqrt((1 / k + n_test / n_train) * v.var(ddof=1)))
+    t = float(stats.t.ppf(0.975, k - 1))
+    return {"mean": mean, "lo": mean - t * se, "hi": mean + t * se, "k": k}
+
+
+# ---------------------------------------------------------------------------
+# Evaluation
+# ---------------------------------------------------------------------------
+
 def default_peers(df, ladder, k: int = 2) -> list[str]:
     """The k non-ladder models whose mean cost is closest to the middle model's."""
     mid_cost = df[f"{ladder['middle']}|total_cost"].mean()
@@ -273,283 +358,231 @@ def evaluate(df, ladder, args) -> dict:
     from sklearn.metrics import roc_auc_score
 
     from smartroute.decision import DecisionLayer
-    from smartroute.escalation import pair_features, tail
+    from smartroute.escalation import answers_agree, pair_features, tail
 
-    cache = args.cache_dir
+    n = len(df)
     texts = df["text"].tolist()
-    emb_texts = [tail(t, args.tail_chars) for t in texts]
     resp_col = f"{ladder['middle']}|model_response"
-    responses = [tail(str(r) if r is not None else "", args.tail_chars) for r in df[resp_col].tolist()]
 
+    # -- per-row quantities, computed once ------------------------------------
     print("embedding prompts ...", flush=True)
-    P = embed(emb_texts, cache, "prompt")
+    P = embed([tail(t, args.tail_chars) for t in texts], args.cache_dir, "prompt")
     print(f"embedding {ladder['middle']} answers ...", flush=True)
-    R = embed(responses, cache, "resp-" + ladder["middle"].replace("/", "_"))
-
-    rng = np.random.default_rng(args.seed)
-    test = rng.random(len(df)) < 0.3
-    train = ~test
-
-    S = np.stack([df[ladder[t]].to_numpy(float) for t in TIERS], axis=1)          # (n, 3)
-    C = np.stack([df[f"{ladder[t]}|total_cost"].to_numpy(float) for t in TIERS], axis=1)
-    mid_wrong = S[:, 1] < _WRONG_BELOW
-    jev_cost = (df["text"].str.len().to_numpy() + np.array([len(r) for r in responses])) / 4.0
-    jev_cost = jev_cost * args.jev_price_per_mtok / 1_000_000
-
-    # -- checker: train on 70%, score the 30% ------------------------------
-    print("training checker ...", flush=True)
+    R = embed([tail(str(r) if r is not None else "", args.tail_chars) for r in df[resp_col]],
+              args.cache_dir, "resp-" + ladder["middle"].replace("/", "_"))
     feats = pair_features(P, R)
-    head, head_kind, val_auc = fit_checker(feats[train], ~mid_wrong[train], args.seed)
-    p_correct = head.predict_proba(feats[test])[:, 1]
-    test_auc = float(roc_auc_score(~mid_wrong[test], p_correct))
-    if args.save_checker:
-        import joblib
 
-        joblib.dump({"head": head, "encoder": ENCODER, "tail_chars": args.tail_chars,
-                     "trained_on": f"routerbench:{args.data.name}:{ladder['middle']}:train70"},
-                    args.save_checker)
+    S = np.stack([df[ladder[t]].to_numpy(float) for t in TIERS], axis=1)
+    C = np.stack([df[f"{ladder[t]}|total_cost"].to_numpy(float) for t in TIERS], axis=1)
+    wrong = S[:, 1] < _WRONG_BELOW
+    groups = df["eval_name"].map(_group).to_numpy()
 
-    # -- test-split arrays ---------------------------------------------------
-    St, Ct, Pt = S[test], C[test], np.array(texts, dtype=object)[test]
-    wrong_t, jev_t = mid_wrong[test], jev_cost[test]
-    groups_t = df.loc[test, "eval_name"].map(_group).to_numpy()
-    first: dict[str, int] = {}
-    for i, t in enumerate(texts):
-        first.setdefault(t, i)
-    triage = PrecomputedTriage(list(first), P[list(first.values())], args.triage)
-
-    # -- consistency checkers: agreement with other models' recorded answers ----
-    # RouterBench has one answer per model, so true self-resampling cannot be
-    # replayed. Cross-model agreement is the replayable proxy, and is SC_SOURCE=cheap
-    # in production when the peer is the cheap tier.
-    from smartroute.escalation import answers_agree
-
-    test_rows = np.nonzero(test)[0]
-    mid_answers = [_user_text(str(df.at[i, resp_col])) for i in test_rows]
+    # Consistency: agreement with other models' *recorded* answers (one answer per
+    # model, so same-model resampling cannot be replayed).
+    mid_answers = [_user_text(str(r)) for r in df[resp_col]]
     peers = args.sc_peers or default_peers(df, ladder)
 
     def agreement(models):
-        votes = np.zeros(len(test_rows))
-        cost = np.zeros(len(test_rows))
+        votes, cost = np.zeros(n), np.zeros(n)
         for m in models:
-            col = df[f"{m}|model_response"]
-            votes += [answers_agree(a, _user_text(str(col.iat[i]))) for a, i in zip(mid_answers, test_rows)]
-            cost += df[f"{m}|total_cost"].to_numpy(float)[test_rows]
+            other = df[f"{m}|model_response"]
+            votes += [answers_agree(a, _user_text(str(b))) for a, b in zip(mid_answers, other)]
+            cost += df[f"{m}|total_cost"].to_numpy(float)
         return votes / len(models), cost
 
     print(f"scoring agreement with {peers} and {ladder['cheap']} ...", flush=True)
     p_peers, cost_peers = agreement(peers)
     p_cheap, cost_cheap = agreement([ladder["cheap"]])
-    checkers = {
-        "learned": (p_correct, np.zeros(len(test_rows))),
-        "consistency[cheap]": (p_cheap, cost_cheap),
-        "consistency[peers]": (p_peers, cost_peers),
-        "learned+consistency[peers]": ((p_correct + p_peers) / 2, cost_peers),
-    }
-    checker_auc = {name: float(roc_auc_score(~wrong_t, p)) for name, (p, _) in checkers.items()}
 
-    def tiers_for(lmbda) -> tuple[np.ndarray, collections.Counter, DecisionLayer]:
-        layer = DecisionLayer(triage=triage, lambda_wrong_usd=lmbda)
-        paths = [layer.decide(t).path for t in Pt]
-        idx = np.array([TIERS.index("frontier" if p == "decompose" else p) for p in paths])
-        return idx, collections.Counter(paths), layer
-
-    def point(idx, escalate=None, extra_cost=None):
-        s = St[np.arange(len(idx)), idx].copy()
-        c = Ct[np.arange(len(idx)), idx].copy()
-        if escalate is not None:
-            m = (idx == 1) & escalate
-            s[m] = St[m, 2]
-            if extra_cost is not None:
-                c[idx == 1] += extra_cost[idx == 1]
-            c[m] += Ct[m, 2]
-        return float(s.mean()), float(c.mean()), s
-
-    fixed = {t: (float(St[:, i].mean()), float(Ct[:, i].mean())) for i, t in enumerate(TIERS)}
-    lo, hi = fixed["cheap"][1], fixed["frontier"][1]
-    endpoints = [(fixed["cheap"][1], fixed["cheap"][0]), (fixed["frontier"][1], fixed["frontier"][0])]
-    all11 = [(float(df.loc[test, f"{m}|total_cost"].mean()), float(df.loc[test, m].mean())) for m in ALL_MODELS]
-
-    curves: dict[str, list[tuple[float, float]]] = {
-        "zero (ladder)": [(c, a) for a, c in fixed.values()],
-        "zero (all 11)": all11,
-        "decision": list(endpoints),
-        **{f"decision+{name}": list(endpoints) for name in checkers},
-        "decision+perfect": list(endpoints),
-    }
-    sweep = []
-    catalog = None
+    first: dict[str, int] = {}
+    for i, t in enumerate(texts):
+        first.setdefault(t, i)
+    triage = PrecomputedTriage(list(first), P[list(first.values())], args.triage)
+    routes = {}
     for lmbda in LAMBDAS:
-        idx, counts, layer = tiers_for(lmbda)
-        acc, cost, s_route = point(idx)
-        curves["decision"].append((cost, acc))
-        # The checker can always be switched off, so its curve includes this point.
-        for name in checkers:
-            curves[f"decision+{name}"].append((cost, acc))
-        curves["decision+perfect"].append((cost, acc))
-        pa, pc, _ = point(idx, escalate=wrong_t)
-        curves["decision+perfect"].append((pc, pa))
-        row = {"lambda": layer._lambda, "paths": dict(counts), "accuracy": acc, "cost": cost,
-               "perfect": {"accuracy": pa, "cost": pc}, "checkers": {}}
-        for name, (p, extra) in checkers.items():
-            row["checkers"][name] = {}
-            for th in THRESHOLDS:
-                ca, cc, _ = point(idx, escalate=p < th, extra_cost=extra)
-                curves[f"decision+{name}"].append((cc, ca))
-                row["checkers"][name][f"{th:.2f}"] = {
-                    "accuracy": ca, "cost": cc, "escalation_rate": float((p[idx == 1] < th).mean())}
-        sweep.append(row)
-        if lmbda is None:
-            catalog = (idx, counts, layer, s_route)
+        layer = DecisionLayer(triage=triage, lambda_wrong_usd=lmbda)
+        paths = [layer.decide(t).path for t in texts]
+        routes[lmbda] = (np.array([TIERS.index("frontier" if q == "decompose" else q) for q in paths]),
+                         paths, layer)
 
-    aiqs, reach = {}, {}
-    target = 0.95 * fixed["frontier"][0]
-    for name, pts in curves.items():
-        v, grid, vals = aiq(pts, lo, hi)
-        aiqs[name] = v
-        reach[name] = cost_to_reach(grid, vals, target)
+    jev = None
+    if args.jev:
+        mid_rows = np.arange(n)  # every row: which rows are test, and which go middle, varies
+        if args.jev_limit:
+            mid_rows = np.random.default_rng(0).choice(mid_rows, size=min(args.jev_limit, n), replace=False)
+        p_j, c_j, failed = jev_scores(df, ladder, sorted(mid_rows.tolist()), args)
+        jev = {"rows": np.array(sorted(mid_rows.tolist())), "p": p_j, "cost": c_j, "failed": failed}
 
-    # -- headline arms at the catalog lambda --------------------------------
-    idx, counts, layer, s_route = catalog
-    arms = {f"always-{t}": {"accuracy": a, "cost": c} for t, (a, c) in fixed.items()}
-    arms["routed"] = {"accuracy": sweep[0]["accuracy"], "cost": sweep[0]["cost"]}
-    # Headline threshold per checker: most accurate setting costing at most half of
-    # always-frontier. Chosen on the test split, so it flatters slightly; AIQ and the
-    # full sweep are the threshold-free numbers.
-    for name in checkers:
-        table = sweep[0]["checkers"][name]
-        affordable = [k for k, v in table.items() if v["cost"] <= 0.5 * fixed["frontier"][1]]
-        best = (max(affordable, key=lambda k: table[k]["accuracy"]) if affordable
-                else min(table, key=lambda k: table[k]["cost"]))
-        arms[f"routed+{name}@{best}"] = table[best]
-    arms["routed+perfect checker"] = sweep[0]["perfect"]
-    oracle_idx = np.where(St[:, 0] > 0, 0, np.where(St[:, 1] > 0, 1, np.where(St[:, 2] > 0, 2, 0)))
-    oa, oc, _ = point(oracle_idx)
-    arms["oracle (ladder)"] = {"accuracy": oa, "cost": oc}
+    # -- one split ----------------------------------------------------------
+    def run_split(split_seed: int) -> dict:
+        rng = np.random.default_rng(split_seed)
+        test = rng.random(n) < 0.3
+        if jev is not None:  # with a Jev subsample, evaluate only where Jev scored
+            scored = np.zeros(n, dtype=bool)
+            scored[jev["rows"]] = True
+            test &= scored
+        train = ~test
+        rows = np.nonzero(test)[0]
 
-    by_group = {}
-    for g in sorted(set(groups_t), key=lambda g: -(groups_t == g).sum()):
-        m = groups_t == g
-        by_group[g] = {"n": int(m.sum()), "cheap": float(St[m, 0].mean()), "middle": float(St[m, 1].mean()),
-                       "frontier": float(St[m, 2].mean()), "routed": float(s_route[m].mean())}
+        head, head_kind, _ = fit_checker(feats[train], ~wrong[train], split_seed)
+        p_learned = head.predict_proba(feats[rows])[:, 1]
+        checkers = {
+            "learned": (p_learned, np.zeros(len(rows))),
+            "consistency[cheap]": (p_cheap[rows], cost_cheap[rows]),
+            "consistency[peers]": (p_peers[rows], cost_peers[rows]),
+            "learned+consistency[peers]": ((p_learned + p_peers[rows]) / 2, cost_peers[rows]),
+        }
+        if jev is not None:
+            pos = {r: k for k, r in enumerate(jev["rows"])}
+            sel = [pos[r] for r in rows]
+            pj, cj = jev["p"][sel], jev["cost"][sel]
+            checkers["jev"] = (pj, cj)
+            checkers["jev+learned"] = ((pj + p_learned) / 2, cj)
+            checkers["jev+consistency[cheap]"] = ((pj + p_cheap[rows]) / 2, cj + cost_cheap[rows])
 
-    # -- simulated checker grid (Jev-priced) --------------------------------
-    sim = {}
-    for detect in (1.0, 0.9, 0.8, 0.7, 0.5):
-        for fa in (0.0, 0.1, 0.2, 0.3):
-            esc_p = np.where(wrong_t, detect, fa)
+        St, Ct, wt = S[rows], C[rows], wrong[rows]
+
+        def point(idx, escalate=None, extra=None):
             s_ = St[np.arange(len(idx)), idx].copy()
             c_ = Ct[np.arange(len(idx)), idx].copy()
-            mm = idx == 1
-            s_[mm] = (1 - esc_p[mm]) * s_[mm] + esc_p[mm] * St[mm, 2]
-            c_[mm] += jev_t[mm] + esc_p[mm] * Ct[mm, 2]
-            sim[f"{detect:.1f}/{fa:.1f}"] = {"accuracy": float(s_.mean()), "cost": float(c_.mean())}
+            if escalate is not None:
+                m = (idx == 1) & escalate
+                s_[m] = St[m, 2]
+                if extra is not None:
+                    c_[idx == 1] += extra[idx == 1]
+                c_[m] += Ct[m, 2]
+            return float(s_.mean()), float(c_.mean()), s_
 
-    live = live_escalation(df, ladder, test_rows[idx == 1], args) if args.jev_verify else None
-
-    return {
-        "data": args.data.name, "n_total": len(df), "n_test": int(test.sum()), "ladder": ladder,
-        "triage": triage.backend(), "tail_chars": args.tail_chars,
-        "lookup_threshold": layer._lookup_threshold, "path_counts": dict(counts),
-        "checker": {"kind": head_kind, "val_auc": val_auc, "test_auc": test_auc,
-                    "middle_wrong_rate_test": float(wrong_t.mean())},
-        "checker_auc": checker_auc, "sc_peers": peers,
-        "arms": arms, "by_group": by_group, "aiq": aiqs, "cost_range": [lo, hi],
-        "cost_to_95pct_frontier": reach, "frontier_accuracy": fixed["frontier"][0],
-        "lambda_sweep": sweep, "jev_sim": sim, "jev_live": live,
-        "jev_price_per_mtok": args.jev_price_per_mtok,
-    }
-
-
-# ---------------------------------------------------------------------------
-# Live Jev checks (costs money; needs OPENROUTER_API_KEY)
-# ---------------------------------------------------------------------------
-
-def live_escalation(df, ladder, middle_rows, args) -> dict:
-    import asyncio
-    import os
-    import random
-
-    from smartroute.escalation import JevVerifier
-
-    rows = sorted(random.Random(args.seed).sample(list(middle_rows), min(args.jev_verify, len(middle_rows))))
-    verifier = JevVerifier(os.environ.get("OPENROUTER_API_KEY", ""), threshold=0.5, model=args.decision_model)
-    col = f"{ladder['middle']}|model_response"
-
-    async def run():
-        sem = asyncio.Semaphore(args.concurrency)
-
-        async def one(i):
-            async with sem:
-                r = await verifier.check(df.at[i, "text"], str(df.at[i, col] or ""))
-                return i, r.p_correct, r.cost_usd
-        return await asyncio.gather(*(one(i) for i in rows))
-
-    ok = [(i, p, c) for i, p, c in asyncio.run(run()) if p is not None]
-    if not ok:
-        raise SystemExit("every Jev check failed — is OPENROUTER_API_KEY set?")
-    ids = [i for i, _, _ in ok]
-    p = np.array([q for _, q, _ in ok])
-    cost = np.array([c for _, _, c in ok])
-    mid, front = df.loc[ids, ladder["middle"]].to_numpy(float), df.loc[ids, ladder["frontier"]].to_numpy(float)
-    cm = df.loc[ids, f"{ladder['middle']}|total_cost"].to_numpy(float)
-    cf = df.loc[ids, f"{ladder['frontier']}|total_cost"].to_numpy(float)
-    wrong = mid < _WRONG_BELOW
-    from sklearn.metrics import roc_auc_score
-
-    sweep = {}
-    for th in (0.3, 0.5, 0.6, 0.7, 0.8, 0.85, 0.9, 0.95):
-        e = p < th
-        sweep[f"{th:.2f}"] = {
-            "accuracy": float(np.where(e, front, mid).mean()),
-            "cost": float((cm + cost + e * cf).mean()),
-            "escalation_rate": float(e.mean()),
-            "detection_rate": float(e[wrong].mean()) if wrong.any() else 0.0,
-            "false_alarm_rate": float(e[~wrong].mean()) if (~wrong).any() else 0.0,
+        fixed = {t: (float(St[:, i].mean()), float(Ct[:, i].mean())) for i, t in enumerate(TIERS)}
+        lo, hi = fixed["cheap"][1], fixed["frontier"][1]
+        ends = [(fixed["cheap"][1], fixed["cheap"][0]), (fixed["frontier"][1], fixed["frontier"][0])]
+        curves = {
+            "zero (ladder)": [(c, a) for a, c in fixed.values()],
+            "zero (all 11)": [(float(df[f"{m}|total_cost"].to_numpy(float)[rows].mean()),
+                               float(df[m].to_numpy(float)[rows].mean())) for m in ALL_MODELS],
+            "decision": list(ends),
+            **{f"decision+{k}": list(ends) for k in checkers},
+            "decision+perfect": list(ends),
         }
-    return {"n_checked": len(ok), "auc": float(roc_auc_score(~wrong, p)) if 0 < wrong.sum() < len(wrong) else None,
-            "jev_cost_per_check": float(cost.mean()), "threshold_sweep": sweep}
+        table = {}
+        for lmbda in LAMBDAS:
+            idx = routes[lmbda][0][rows]
+            acc, cost, s_route = point(idx)
+            for name in curves:
+                if name.startswith("decision"):
+                    curves[name].append((cost, acc))  # every checker can be switched off
+            pa, pc, _ = point(idx, escalate=wt)
+            curves["decision+perfect"].append((pc, pa))
+            for name, (p, extra) in checkers.items():
+                for th in THRESHOLDS:
+                    ca, cc, _ = point(idx, escalate=p < th, extra=extra)
+                    curves[f"decision+{name}"].append((cc, ca))
+                    if lmbda is None:
+                        table.setdefault(name, {})[f"{th:.2f}"] = {"accuracy": ca, "cost": cc}
+            if lmbda is None:
+                catalog_idx, catalog_route = idx, (acc, cost, s_route, pa, pc)
+
+        target = 0.95 * fixed["frontier"][0]
+        aiqs, reach = {}, {}
+        for name, pts in curves.items():
+            v, grid, vals = aiq(pts, lo, hi)
+            c95 = cost_to_reach(grid, vals, target)
+            aiqs[name], reach[name] = v, (c95 / hi if c95 is not None else None)
+
+        acc, cost, s_route, pa, pc = catalog_route
+        arms = {f"always-{t}": {"accuracy": a, "cost": c} for t, (a, c) in fixed.items()}
+        arms["routed"] = {"accuracy": acc, "cost": cost}
+        for name, tab in table.items():
+            ok = [k for k, v in tab.items() if v["cost"] <= 0.5 * hi]
+            best = max(ok, key=lambda k: tab[k]["accuracy"]) if ok else min(tab, key=lambda k: tab[k]["cost"])
+            arms[f"routed+{name}@{best}"] = tab[best]
+        arms["routed+perfect checker"] = {"accuracy": pa, "cost": pc}
+        oracle = np.where(St[:, 0] > 0, 0, np.where(St[:, 1] > 0, 1, np.where(St[:, 2] > 0, 2, 0)))
+        oa, oc, _ = point(oracle)
+        arms["oracle (ladder)"] = {"accuracy": oa, "cost": oc}
+
+        by_group = {}
+        for g in sorted(set(groups[rows]), key=lambda g: -(groups[rows] == g).sum()):
+            m = groups[rows] == g
+            by_group[g] = {"n": int(m.sum()), "cheap": float(St[m, 0].mean()), "middle": float(St[m, 1].mean()),
+                           "frontier": float(St[m, 2].mean()), "routed": float(s_route[m].mean())}
+        return {
+            "seed": split_seed, "n_test": int(len(rows)), "n_train": int(train.sum()),
+            "learned_kind": head_kind, "middle_wrong_rate": float(wt.mean()),
+            "auc": {k: float(roc_auc_score(~wt, p)) for k, (p, _) in checkers.items()},
+            "aiq": aiqs, "cost_to_95pct": reach, "arms": arms, "by_group": by_group,
+            "frontier_accuracy": fixed["frontier"][0], "cost_range": [lo, hi],
+            "paths": dict(collections.Counter(np.array(routes[None][1], dtype=object)[rows])),
+        }
+
+    splits = []
+    for k in range(args.splits):
+        print(f"split {k + 1}/{args.splits} ...", flush=True)
+        splits.append(run_split(args.seed + k))
+
+    # -- aggregate ------------------------------------------------------------
+    n_tr = int(np.mean([sp["n_train"] for sp in splits]))
+    n_te = int(np.mean([sp["n_test"] for sp in splits]))
+    ci = lambda vals: corrected_ci(vals, n_tr, n_te)  # noqa: E731
+    names = list(splits[0]["aiq"])
+    summary = {
+        "aiq": {k: ci([sp["aiq"][k] for sp in splits]) for k in names},
+        # paired: same split, so split-to-split variation cancels
+        "aiq_vs_zero_all11": {k: ci([sp["aiq"][k] - sp["aiq"]["zero (all 11)"] for sp in splits]) for k in names},
+        "aiq_vs_decision": {k: ci([sp["aiq"][k] - sp["aiq"]["decision"] for sp in splits]) for k in names},
+        "cost_to_95pct": {k: ci([sp["cost_to_95pct"][k] if sp["cost_to_95pct"][k] is not None else np.nan
+                                 for sp in splits]) for k in names},
+        "auc": {k: ci([sp["auc"][k] for sp in splits]) for k in splits[0]["auc"]},
+    }
+    return {
+        "data": args.data.name, "n_total": n, "ladder": ladder, "triage": triage.backend(),
+        "tail_chars": args.tail_chars, "sc_peers": peers, "splits": len(splits),
+        "jev": None if jev is None else {"scored": int(len(jev["rows"])), "failed": jev["failed"],
+                                         "cost_per_check": float(jev["cost"].mean()),
+                                         "price_per_mtok": args.jev_price_per_mtok},
+        "summary": summary, "per_split": splits,
+    }
 
 
 # ---------------------------------------------------------------------------
 # Output
 # ---------------------------------------------------------------------------
 
+def _fmt(c: dict, pct: bool = False, signed: bool = False) -> str:
+    f = (lambda x: f"{x:+.1%}" if signed else f"{x:.1%}") if pct else \
+        (lambda x: f"{x:+.4f}" if signed else f"{x:.4f}")
+    if c["mean"] is None or np.isnan(c["mean"]):
+        return "never"
+    if c["lo"] is None:
+        return f(c["mean"])
+    return f"{f(c['mean'])} [{f(c['lo'])}, {f(c['hi'])}]"
+
+
 def render(r: dict) -> None:
-    print(f"\nRouterBench {r['data']} — test n={r['n_test']} of {r['n_total']}, triage={r['triage']}, "
-          f"embed tail={r['tail_chars']} chars")
+    sp0 = r["per_split"][0]
+    print(f"\nRouterBench {r['data']} — {r['n_total']} prompts, {r['splits']} random 70/30 splits "
+          f"(test n≈{sp0['n_test']}), triage={r['triage']}")
     print("ladder: " + " -> ".join(f"{k}={v}" for k, v in r["ladder"].items()))
-    print("paths @ catalog lambda: " + ", ".join(f"{k}={v}" for k, v in sorted(r["path_counts"].items())))
-    ck = r["checker"]
-    print(f"middle wrong on {ck['middle_wrong_rate_test']:.1%} of test prompts; "
-          f"consistency peers: {', '.join(r['sc_peers'])}")
-    print("checker test AUC: " + ", ".join(f"{k} {v:.3f}" for k, v in r["checker_auc"].items())
-          + f"  (learned = {ck['kind']})\n")
+    print(f"consistency peers: {', '.join(r['sc_peers'])}")
+    if r["jev"]:
+        j = r["jev"]
+        print(f"jev: {j['scored']} rows scored ({j['failed']} failed -> no escalation), "
+              f"${j['cost_per_check']:.6f}/check at ${j['price_per_mtok']}/M")
+    print("intervals: mean [95% CI], Nadeau-Bengio corrected across splits\n")
 
-    base = r["arms"]["always-cheap"]["cost"]
-    print(f"{'arm':<46}{'accuracy':>10}{'$/query':>12}{'vs cheap':>10}")
-    for name, a in r["arms"].items():
-        print(f"{name:<46}{a['accuracy']:>10.1%}{a['cost']:>12.6f}{a['cost'] / base:>9.2f}x")
+    print("checker AUC")
+    for k, v in r["summary"]["auc"].items():
+        print(f"  {k:<30} {_fmt(v)}")
 
-    lo, hi = r["cost_range"]
-    print(f"\nAIQ over ${lo:.6f}..${hi:.6f}/query (higher is better); "
-          f"cost to reach 95% of frontier accuracy ({0.95 * r['frontier_accuracy']:.1%})")
-    zero = r["aiq"]["zero (ladder)"]
-    for name, v in r["aiq"].items():
-        c = r["cost_to_95pct_frontier"][name]
-        reach = f"${c:.6f} ({c / hi:.0%} of frontier)" if c is not None else "never"
-        print(f"  {name:<36} AIQ {v:.4f}  ({v - zero:+.4f} vs zero-ladder)   95%: {reach}")
+    print(f"\n{'router':<40}{'AIQ':<28}{'vs zero (all 11)':<30}{'vs no checker':<30}cost to 95% of frontier")
+    s = r["summary"]
+    for k in s["aiq"]:
+        print(f"{k:<40}{_fmt(s['aiq'][k]):<28}{_fmt(s['aiq_vs_zero_all11'][k], signed=True):<30}"
+              f"{_fmt(s['aiq_vs_decision'][k], signed=True):<30}{_fmt(s['cost_to_95pct'][k], pct=True)}")
 
-    print(f"\n{'group':<22}{'n':>6}{'cheap':>8}{'middle':>8}{'front':>8}{'routed':>8}")
-    for g, v in r["by_group"].items():
-        print(f"{g:<22}{v['n']:>6}{v['cheap']:>8.1%}{v['middle']:>8.1%}{v['frontier']:>8.1%}{v['routed']:>8.1%}")
-
-    if r.get("jev_live"):
-        live = r["jev_live"]
-        print(f"\nLive Jev — n={live['n_checked']}, AUC {live['auc']}, ${live['jev_cost_per_check']:.6f}/check")
-        for th, v in live["threshold_sweep"].items():
-            print(f"  th={th} acc {v['accuracy']:.1%} ${v['cost']:.6f} escalate {v['escalation_rate']:.1%} "
-                  f"detect {v['detection_rate']:.1%} false+ {v['false_alarm_rate']:.1%}")
+    print(f"\nsplit 1 arms (catalog lambda):\n{'arm':<46}{'accuracy':>10}{'$/query':>12}")
+    for name, a in sp0["arms"].items():
+        print(f"{name:<46}{a['accuracy']:>10.1%}{a['cost']:>12.6f}")
 
 
 def main() -> None:
@@ -557,20 +590,21 @@ def main() -> None:
     ap.add_argument("--data", type=Path, required=True, help="routerbench_5shot.pkl (or _0shot)")
     ap.add_argument("--n", type=int, default=None, help="subsample size (default: all)")
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--splits", type=int, default=5, help="random 70/30 splits for confidence intervals")
     ap.add_argument("--triage", choices=("embedding", "heuristic"), default="embedding")
     ap.add_argument("--cheap", default=DEFAULT_LADDER["cheap"])
     ap.add_argument("--middle", default=DEFAULT_LADDER["middle"])
     ap.add_argument("--frontier", default=DEFAULT_LADDER["frontier"])
     ap.add_argument("--tail-chars", type=int, default=1000, help="embed only the prompt's last N chars (0 = all)")
-    ap.add_argument("--jev-price-per-mtok", type=float, default=JEV_PRICE_PER_MTOK)
-    ap.add_argument("--jev-verify", type=int, default=0, metavar="N",
-                    help="run N live Jev checks on test-split middle answers (costs money; OPENROUTER_API_KEY)")
-    ap.add_argument("--decision-model", default="~typesafe/jev-latest")
-    ap.add_argument("--concurrency", type=int, default=8)
     ap.add_argument("--sc-peers", type=lambda v: [m.strip() for m in v.split(",") if m.strip()],
                     default=None, help="models whose recorded answers the consistency checker compares "
                                        "against (default: 2 non-ladder models priced nearest the middle)")
-    ap.add_argument("--save-checker", type=Path, default=None, help="write the fitted checker (joblib)")
+    ap.add_argument("--jev", action="store_true",
+                    help="score middle answers with Jev (costs money: TYPESAFE_API_KEY or OPENROUTER_API_KEY)")
+    ap.add_argument("--jev-limit", type=int, default=0, help="score only this many random rows with Jev")
+    ap.add_argument("--jev-price-per-mtok", type=float, default=JEV_PRICE_PER_MTOK)
+    ap.add_argument("--decision-model", default="~typesafe/jev-latest")
+    ap.add_argument("--concurrency", type=int, default=16)
     ap.add_argument("--cache-dir", type=Path, default=_REPO_ROOT / "harness" / "results" / ".cache")
     ap.add_argument("--out", type=Path, default=_REPO_ROOT / "harness" / "results" / "routerbench.json")
     args = ap.parse_args()

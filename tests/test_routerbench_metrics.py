@@ -32,3 +32,16 @@ def test_cost_to_reach():
     _, grid, vals = aiq([(0.0, 0.5), (2.0, 0.9)], 0.0, 2.0)
     assert cost_to_reach(grid, vals, 0.7) == pytest.approx(1.0, abs=1e-3)
     assert cost_to_reach(grid, vals, 0.99) is None
+
+
+def test_corrected_ci_is_wider_than_naive():
+    from scipy import stats
+
+    from harness.routerbench import corrected_ci
+
+    vals = [0.70, 0.72, 0.71, 0.69, 0.73]
+    ci = corrected_ci(vals, n_train=7000, n_test=3000)
+    naive_half = stats.t.ppf(0.975, 4) * np.std(vals, ddof=1) / np.sqrt(5)
+    assert ci["mean"] == pytest.approx(0.71)
+    assert (ci["hi"] - ci["mean"]) > naive_half      # overlap correction widens it
+    assert corrected_ci([0.7], 7000, 3000)["lo"] is None

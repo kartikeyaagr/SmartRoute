@@ -95,12 +95,18 @@ class JevVerifier:
         model: str = DEFAULT_DECISION_MODEL,
         client: httpx.AsyncClient | None = None,
         timeout_s: float = 10.0,
+        provider: str = "openrouter",
+        price_per_mtok: float | None = None,
     ) -> None:
         if not api_key:
-            raise TaskRouteError("OPENROUTER_API_KEY is required for Jev escalation")
+            raise TaskRouteError(
+                "a Jev key is required for escalation: TYPESAFE_API_KEY or OPENROUTER_API_KEY"
+            )
         self.threshold = threshold
         self._decisions = DecisionsClient(
-            api_key, TaskRouteConfig(decision_model=model, timeout_s=timeout_s), client=client
+            api_key, TaskRouteConfig(decision_model=model, timeout_s=timeout_s), client=client,
+            provider=provider,
+            **({"price_per_mtok": price_per_mtok} if price_per_mtok is not None else {}),
         )
 
     async def check(self, prompt: str, response: str, messages: list[dict] | None = None) -> VerifyResult:
@@ -109,8 +115,8 @@ class JevVerifier:
         try:
             answers, cost = await self._decisions.decide(
                 state={
-                    "user_message": prompt[:_PROMPT_CHARS],
-                    "assistant_response": response[:_RESPONSE_CHARS],
+                    "user_message": prompt[-_PROMPT_CHARS:],  # keep the end: few-shot prompts ask last
+                    "assistant_response": response[-_RESPONSE_CHARS:],
                 },
                 questions=QUESTION,
             )
