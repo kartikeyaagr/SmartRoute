@@ -5,6 +5,7 @@ description = "LLM inference router with difficulty-based routing and FrugalGPT-
 # 3.13 was the tested env at project start; 3.11+ is likely compatible but unverified.
 # Relax to >=3.11 once CI validates multi-version support.
 requires-python = ">=3.13"
+license = "GPL-3.0-only"
 dependencies = [
     "litellm>=1.83.9",
     "pydantic-settings>=2.0",
