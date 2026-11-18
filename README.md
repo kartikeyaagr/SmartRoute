@@ -81,7 +81,7 @@ git clone <repo> && cd SmartRoute
 uv sync --extra server --extra ml --group dev
 cp .env.example .env          # add one provider key
 
-uv run pytest                 # 202 tests, no network
+uv run pytest                 # 246 tests, no network
 ```
 
 Route a request as a library:
