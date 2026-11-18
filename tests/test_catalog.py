@@ -322,13 +322,21 @@ class TestProviderSwapAcceptance:
     files and ~45 test assertions; this test is what stops that from recurring.
     """
 
+    # Prices are pinned rather than read from litellm's registry: the registry drops
+    # models over time (it no longer lists any of these four), and a swap test that
+    # fails whenever litellm updates tests the registry, not the swap. The registry
+    # path itself is covered by the price-resolution tests above.
     GROQ = """
         version: 1
         models:
-          - {alias: cheap,    id: groq/llama-3.1-8b-instant,    role: cheap,    env_key: GROQ_API_KEY}
-          - {alias: middle,   id: groq/qwen/qwen3-32b,          role: middle,   env_key: GROQ_API_KEY}
-          - {alias: frontier, id: groq/llama-3.3-70b-versatile, role: frontier, env_key: GROQ_API_KEY}
-          - {alias: judge,    id: groq/gemma-7b-it,             role: judge,    env_key: GROQ_API_KEY}
+          - {alias: cheap,    id: groq/llama-3.1-8b-instant,    role: cheap,    env_key: GROQ_API_KEY,
+             price: {input_per_mtok: 0.05, output_per_mtok: 0.08}}
+          - {alias: middle,   id: groq/qwen/qwen3-32b,          role: middle,   env_key: GROQ_API_KEY,
+             price: {input_per_mtok: 0.29, output_per_mtok: 0.59}}
+          - {alias: frontier, id: groq/llama-3.3-70b-versatile, role: frontier, env_key: GROQ_API_KEY,
+             price: {input_per_mtok: 0.59, output_per_mtok: 0.79}}
+          - {alias: judge,    id: groq/gemma-7b-it,             role: judge,    env_key: GROQ_API_KEY,
+             price: {input_per_mtok: 0.07, output_per_mtok: 0.07}}
         routing:
           tiers: [cheap, middle, frontier]
           default_tier: middle
