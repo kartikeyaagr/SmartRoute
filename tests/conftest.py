@@ -13,6 +13,12 @@ import textwrap
 import pytest
 
 from smartroute.catalog import load_catalog, set_catalog
+from smartroute.config import settings
+
+# The suite must not depend on a developer's .env (a DATABASE_URL or SERVER_API_KEY
+# there would change server behaviour). Re-init the shared instance in place so every
+# `from smartroute.config import settings` reference sees the .env-free values.
+settings.__init__(_env_file=None)
 
 # Real ids so prices resolve from litellm's registry, but pinned here so the suite is
 # independent of whatever the shipped models.yaml currently points at.
