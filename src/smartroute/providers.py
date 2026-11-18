@@ -33,56 +33,15 @@ logger = logging.getLogger(__name__)
 _PRICE_DIVERGENCE_TOLERANCE = 0.05  # warn when catalog and registry disagree by >5%
 
 
-# ---------------------------------------------------------------------------
-# Lazy litellm
-# ---------------------------------------------------------------------------
-# Importing litellm costs ~1.6s, and `import smartroute` pulls this module in, so the
-# import is deferred until the first real call. PEP 562 module __getattr__ keeps
-# `smartroute.providers.acompletion` resolvable from outside — which is what
-# mock.patch() needs to find before it can replace it. Internal callers go through
-# _acompletion(), which reads the same module global, so a patched mock is honoured.
-
-_LAZY_LITELLM_ATTRS = {"acompletion", "litellm"}
-
-
-def __getattr__(name: str):
-    if name in _LAZY_LITELLM_ATTRS:
-        import litellm as _ll
-
-        value = _ll.acompletion if name == "acompletion" else _ll
-        globals()[name] = value  # cache: later lookups skip __getattr__ entirely
-        return value
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-
-
-def _acompletion():
-    """Module-global handle to litellm.acompletion, resolved once and patchable."""
-    fn = globals().get("acompletion")
-    if fn is None:
-        from litellm import acompletion as fn  # noqa: PLC0415
-
-        globals()["acompletion"] = fn
-    return fn
-
-
 def _litellm():
-    """Lazy litellm handle — importing it eagerly costs ~1.6s of startup."""
+    """litellm, imported on first use: importing it eagerly costs ~1.6s of startup."""
     import litellm
 
     return litellm
 
 
 def _cost_for(model, spec, input_tokens, output_tokens, response) -> float:
-    """
-    Cost from the catalog, cross-checked against litellm's own estimate.
-
-    Raises CatalogError if `model` is unknown, rather than recording $0.00.
-    """
-    if spec is None:
-        from smartroute.catalog import get_catalog
-
-        spec = get_catalog().resolve(model)
-
+    """Cost from the catalog, cross-checked against litellm's own estimate."""
     cost = spec.cost(input_tokens, output_tokens)
 
     try:
@@ -140,21 +99,17 @@ async def call_model(
     """
     timeout_s = timeout_s or settings.model_timeout_s
 
-    if spec is None and params:
+    if spec is None:
         from smartroute.catalog import get_catalog
 
-        spec = get_catalog().resolve(model)
-    if spec is not None:
-        dropped = set(params) & spec.unsupported_params
-        if dropped:
-            logger.debug("dropping params unsupported by %s: %s", model, sorted(dropped))
-        params = spec.filter_params(params)
+        spec = get_catalog().resolve(model)  # unknown model raises, never costs $0.00
+    params = spec.filter_params(params)
 
     async def _attempt() -> ModelResponse:
         t0 = time.perf_counter()
         try:
             response = await asyncio.wait_for(
-                _acompletion()(model=model, messages=messages, **params),
+                _litellm().acompletion(model=model, messages=messages, **params),
                 timeout=timeout_s,
             )
         except asyncio.TimeoutError:

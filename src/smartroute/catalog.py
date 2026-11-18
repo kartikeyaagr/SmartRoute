@@ -56,14 +56,6 @@ class Price:
     def cost(self, input_tokens: int, output_tokens: int) -> float:
         return input_tokens * self.input_per_token + output_tokens * self.output_per_token
 
-    @property
-    def input_per_mtok(self) -> float:
-        return self.input_per_token * 1_000_000
-
-    @property
-    def output_per_mtok(self) -> float:
-        return self.output_per_token * 1_000_000
-
 
 @dataclass(frozen=True)
 class ModelSpec:
@@ -72,7 +64,6 @@ class ModelSpec:
     role: str
     price: Price
     env_key: str | None = None
-    context_window: int | None = None
     # Generation params this model rejects outright. Newer Claude models return
     # `invalid_request_error: temperature is deprecated for this model`, and an
     # unrecognised param is a hard 400, not a warning — so a benchmark that pins
@@ -120,16 +111,6 @@ def _resolve_price(alias: str, model_id: str, override: dict | None) -> Price:
     )
 
 
-def _resolve_context_window(model_id: str, declared: int | None) -> int | None:
-    if declared is not None:
-        return int(declared)
-    entry = _registry_entry(model_id)
-    if entry is None:
-        return None
-    window = entry.get("max_input_tokens") or entry.get("max_tokens")
-    return int(window) if window else None
-
-
 class Catalog:
     """
     A loaded, validated model catalog.
@@ -142,13 +123,11 @@ class Catalog:
         self,
         models: list[ModelSpec],
         tier_order: list[str],
-        default_tier: str,
         lambda_wrong_answer_usd: float = 0.001,
     ) -> None:
         self._by_alias = {m.alias: m for m in models}
         self._by_id = {m.id: m for m in models}
         self._tier_order = tier_order
-        self._default_tier = default_tier
         self.lambda_wrong_answer_usd = lambda_wrong_answer_usd
 
     # -- lookup ------------------------------------------------------------
@@ -163,18 +142,10 @@ class Catalog:
             )
         return spec
 
-    def __contains__(self, alias_or_id: str) -> bool:
-        return alias_or_id in self._by_alias or alias_or_id in self._by_id
-
     @property
     def tiers(self) -> list[ModelSpec]:
         """Routing tiers, ordered cheap -> expensive."""
         return [self._by_alias[a] for a in self._tier_order]
-
-    @property
-    def default(self) -> ModelSpec:
-        """The tier every non-lookup request falls back to. Deliberately not the frontier."""
-        return self._by_alias[self._default_tier]
 
     def by_role(self, role: str) -> ModelSpec:
         matches = [m for m in self._by_alias.values() if m.role == role]
@@ -226,7 +197,7 @@ class Catalog:
             f"{m.alias}={m.id}@{m.price.input_per_token}/{m.price.output_per_token}"
             for m in sorted(self._by_alias.values(), key=lambda m: m.alias)
         )
-        payload += f"||tiers={','.join(self._tier_order)}|default={self._default_tier}"
+        payload += f"||tiers={','.join(self._tier_order)}"
         return hashlib.sha256(payload.encode()).hexdigest()[:16]
 
 
@@ -303,21 +274,16 @@ def load_catalog(path: str | Path | None = None) -> Catalog:
                 role=role,
                 price=_resolve_price(alias, model_id, entry.get("price")),
                 env_key=entry.get("env_key"),
-                context_window=_resolve_context_window(model_id, entry.get("context_window")),
                 unsupported_params=frozenset(entry.get("unsupported_params") or ()),
             )
         )
 
-    routing = raw.get("routing") or {}
-    tier_order = routing.get("tiers") or [m.alias for m in models if m.role in ("cheap", "middle", "frontier")]
-    default_tier = routing.get("default_tier") or (tier_order[len(tier_order) // 2] if tier_order else None)
-
-    known = {m.alias for m in models}
+    tier_order = (raw.get("routing") or {}).get("tiers")
+    if not tier_order:
+        raise CatalogError(f"{path}: no `routing.tiers` declared")
     for alias in tier_order:
-        if alias not in known:
+        if alias not in seen:
             raise CatalogError(f"{path}: routing.tiers references unknown alias {alias!r}")
-    if default_tier not in known:
-        raise CatalogError(f"{path}: routing.default_tier references unknown alias {default_tier!r}")
 
     # A ladder must actually ascend, or "escalate" and "pick the cheapest that works"
     # are meaningless. Catching this here beats discovering it in a benchmark report.
@@ -336,7 +302,7 @@ def load_catalog(path: str | Path | None = None) -> Catalog:
     if lambda_wrong < 0:
         raise CatalogError(f"{path}: decision.lambda_wrong_answer_usd must be >= 0")
 
-    catalog = Catalog(models, tier_order, default_tier, lambda_wrong)
+    catalog = Catalog(models, tier_order, lambda_wrong)
     logger.debug("catalog loaded: %s (fingerprint %s)", tier_order, catalog.fingerprint())
     return catalog
 

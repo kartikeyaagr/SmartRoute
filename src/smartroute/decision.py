@@ -166,7 +166,7 @@ class EmbeddingTriage:
         if not self._model_path.exists():
             logger.info(
                 "no trained triage model at %s — using heuristic fallback. "
-                "Train with: uv run harness/train_triage.py",
+                "Train with: uv run --extra ml python -m harness.train_triage",
                 self._model_path,
             )
             return
@@ -254,9 +254,7 @@ class DecisionLayer:
         # Defaults to the catalog's knob so the economics live in one file alongside
         # the prices they are compared against.
         self._lambda = (
-            lambda_wrong_usd
-            if lambda_wrong_usd is not None
-            else getattr(self._catalog, "lambda_wrong_answer_usd", 0.001)
+            lambda_wrong_usd if lambda_wrong_usd is not None else self._catalog.lambda_wrong_answer_usd
         )
         self._costs = cost_model or CostModel()
         self._lookup_threshold = (

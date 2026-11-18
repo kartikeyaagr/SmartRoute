@@ -47,9 +47,9 @@ async def test_rate_limit_retry_success():
             )
         return mock_response
 
-    with patch("smartroute.providers.acompletion", side_effect=mock_acompletion):
+    with patch("litellm.acompletion", side_effect=mock_acompletion):
         with patch("smartroute.providers.asyncio.sleep", new_callable=AsyncMock):
-            with patch("smartroute.providers.litellm.completion_cost", return_value=0.001):
+            with patch("litellm.completion_cost", return_value=0.001):
                 result = await call_model("gpt-4o", [{"role": "user", "content": "hi"}], spec=SPEC)
 
     assert call_count == 2
@@ -66,7 +66,7 @@ async def test_rate_limit_retry_exhausted():
             message="rate limited", llm_provider="openai", model="gpt-4o"
         )
 
-    with patch("smartroute.providers.acompletion", side_effect=mock_acompletion):
+    with patch("litellm.acompletion", side_effect=mock_acompletion):
         with patch("smartroute.providers.asyncio.sleep", new_callable=AsyncMock):
             with pytest.raises(ProviderError, match="RateLimitError"):
                 await call_model("gpt-4o", [{"role": "user", "content": "hi"}], spec=SPEC)
@@ -84,7 +84,7 @@ async def test_auth_failure_raises():
             message="invalid key", llm_provider="openai", model="gpt-4o"
         )
 
-    with patch("smartroute.providers.acompletion", side_effect=mock_acompletion):
+    with patch("litellm.acompletion", side_effect=mock_acompletion):
         with pytest.raises(ProviderError, match="AuthenticationError"):
             await call_model("gpt-4o", [{"role": "user", "content": "hi"}], spec=SPEC)
 
@@ -103,7 +103,7 @@ async def test_unknown_model_raises_instead_of_costing_zero():
     async def mock_acompletion(**kwargs):
         return _make_litellm_response()
 
-    with patch("smartroute.providers.acompletion", side_effect=mock_acompletion):
+    with patch("litellm.acompletion", side_effect=mock_acompletion):
         with pytest.raises(CatalogError, match="unknown model"):
             await call_model("some-unknown-model", [{"role": "user", "content": "hi"}])
 
@@ -114,8 +114,8 @@ async def test_cost_comes_from_the_spec_not_the_registry():
     async def mock_acompletion(**kwargs):
         return _make_litellm_response(input_tokens=1000, output_tokens=500)
 
-    with patch("smartroute.providers.acompletion", side_effect=mock_acompletion):
-        with patch("smartroute.providers.litellm.completion_cost", return_value=0.0):
+    with patch("litellm.acompletion", side_effect=mock_acompletion):
+        with patch("litellm.completion_cost", return_value=0.0):
             result = await call_model("gpt-4o", [{"role": "user", "content": "hi"}], spec=SPEC)
 
     # 1000 * 1e-6 + 500 * 2e-6
@@ -131,7 +131,7 @@ async def test_extra_params_are_forwarded_to_the_provider():
         seen.update(kwargs)
         return _make_litellm_response()
 
-    with patch("smartroute.providers.acompletion", side_effect=mock_acompletion):
+    with patch("litellm.acompletion", side_effect=mock_acompletion):
         await call_model(
             "gpt-4o", [{"role": "user", "content": "hi"}],
             spec=SPEC, temperature=0, max_tokens=64, logprobs=True,

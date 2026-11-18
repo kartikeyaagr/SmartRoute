@@ -13,7 +13,7 @@ import pytest
 from smartroute.classifier import DifficultyTier
 from smartroute.providers import ModelResponse, ProviderError
 from smartroute.router import Router, RoutingDecision
-from smartroute.verifier import CascadeVerifier, _pick_verifier, _parse_score
+from smartroute.verifier import CascadeVerifier, _parse_score
 
 from tests.conftest import CHEAP_ID, FRONTIER_ID, JUDGE_ID, MIDDLE_ID
 
@@ -53,15 +53,6 @@ def _make_verifier(score: int) -> CascadeVerifier:
 # ---------------------------------------------------------------------------
 # Verifier unit tests
 # ---------------------------------------------------------------------------
-
-def test_pick_verifier_uses_catalog_judge():
-    # llama-8b cheap → qwen3-32b verifier (Alibaba arch, different from Meta Llama)
-    assert _pick_verifier(CHEAP_ID).id == JUDGE_ID
-
-
-def test_pick_verifier_unknown_uses_default():
-    assert _pick_verifier("unknown/model").id == JUDGE_ID
-
 
 def test_parse_score_valid():
     assert _parse_score("4") == 4
@@ -294,6 +285,7 @@ async def test_verifier_timeout_escalates_internal():
         score = await verifier.score_async("prompt", "response", "claude-haiku-4-5")
 
     assert score == 2
+    assert mock_call.call_args.kwargs["model"] == JUDGE_ID  # the catalog's judge, nothing else
 
 
 @pytest.mark.asyncio

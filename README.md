@@ -83,8 +83,8 @@ why, projected cost, sub-task count — so the response body stays 100% OpenAI-c
 Measure it on your own traffic:
 
 ```bash
-uv run --extra ml harness/eval_routing.py --compare          # routing accuracy, offline, $0
-uv run --extra ml harness/run_routing.py --n 200 --arm all   # live cost/accuracy, all arms
+uv run --extra ml python -m harness.eval_routing --compare          # routing accuracy, offline, $0
+uv run --extra ml python -m harness.run_routing --n 200 --arm all   # live cost/accuracy, all arms
 ```
 
 ### how routing works
@@ -140,7 +140,6 @@ models:
   - {alias: frontier, id: claude-opus-5,             role: frontier, env_key: ANTHROPIC_API_KEY}
 routing:
   tiers: [cheap, middle, frontier]
-  default_tier: middle
 decision:
   lambda_wrong_answer_usd: 0.01
 ```
@@ -210,7 +209,7 @@ grader, and dataset membership supplies the routing labels.
 
 ```bash
 uv run pytest                    # must stay green
-uv run --extra ml harness/eval_routing.py --compare   # routing didn't regress
+uv run --extra ml python -m harness.eval_routing --compare   # routing didn't regress
 ```
 
 ### license

@@ -42,20 +42,13 @@ CREATE TABLE IF NOT EXISTS routing_decisions (
     cache_hit       BOOLEAN     NOT NULL DEFAULT FALSE,
     cache_similarity DOUBLE PRECISION,
     error           TEXT,
-    route_path      TEXT        NOT NULL DEFAULT '',
-    gate_reason     TEXT        NOT NULL DEFAULT '',
-    p_lookup        DOUBLE PRECISION,
-    p_decompose     DOUBLE PRECISION,
-    projected_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
-    subtask_count   INTEGER     NOT NULL DEFAULT 0,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
 )
 """
 
-# CREATE TABLE IF NOT EXISTS does nothing to a table that already exists, so a
-# deployment that predates the two-layer decision fields would keep its old schema and
-# every INSERT would fail — silently, because insert_decision swallows exceptions.
-# These run on every startup and are no-ops once applied.
+# Two-layer decision columns. Added here rather than in CREATE TABLE so fresh and
+# pre-existing tables take the same path (CREATE TABLE IF NOT EXISTS never alters an
+# existing one). Run on every startup; no-ops once applied.
 _MIGRATIONS = [
     "ALTER TABLE routing_decisions ADD COLUMN IF NOT EXISTS route_path TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE routing_decisions ADD COLUMN IF NOT EXISTS gate_reason TEXT NOT NULL DEFAULT ''",

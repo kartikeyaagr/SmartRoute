@@ -43,7 +43,7 @@ broken thing is the efficient one.
 nothing. Start here.
 
 ```bash
-uv run --extra ml harness/eval_routing.py --compare
+uv run --extra ml python -m harness.eval_routing --compare
 ```
 
 Reports, grouped by where each question *should* have gone, where it actually went —
@@ -54,7 +54,7 @@ model and was sent there anyway.
 ### Cost and accuracy, live
 
 ```bash
-uv run --extra ml harness/run_routing.py --n 200 --arm all --catalog models.anthropic.yaml
+uv run --extra ml python -m harness.run_routing --n 200 --arm all --catalog models.anthropic.yaml
 ```
 
 Prints an estimate and asks before spending. Add `--dry-run` to see the estimate alone,
@@ -66,7 +66,7 @@ completes, so a crash costs one result rather than the batch.
 ### Retraining the triage heads
 
 ```bash
-uv run --extra ml harness/train_triage.py --corpora synthetic --test-size 0.5
+uv run --extra ml python -m harness.train_triage --test-size 0.5
 ```
 
 Fits both heads, prints a held-out classification report and a measured
@@ -266,28 +266,12 @@ The most useful contribution to this repo is a corpus the cheap tier fails.
 asserts no duplicate prompts and that every item has assertions, since an item with no
 assertions is unconditionally correct and silently inflates accuracy.
 
-**2. Register a dataset class** in `harness/corpora.py` implementing the `Dataset`
-protocol:
-
-```python
-class MyDataset:
-    name = "mine"
-    expected_path = ATOMIC          # per-item labels override this
-
-    def load(self, n=None, seed=42) -> list[Example]: ...
-    def system_prompt(self) -> str: ...
-    def grade(self, example, response) -> tuple[bool, bool]:   # (correct, extraction_failed)
-        ...
-
-DATASETS["mine"] = MyDataset
-```
-
-**3. Retrain and measure.**
+**2. Retrain and measure** against your JSONL. Every harness script takes `--corpus`:
 
 ```bash
-uv run --extra ml harness/train_triage.py --corpora mine
-uv run --extra ml harness/eval_routing.py --compare
-uv run --extra ml harness/run_routing.py --n 200 --arm all --datasets mine
+uv run --extra ml python -m harness.train_triage --corpus mine.jsonl
+uv run --extra ml python -m harness.eval_routing --compare --corpus mine.jsonl
+uv run --extra ml python -m harness.run_routing --n 200 --arm all --corpus mine.jsonl
 ```
 
 ### Swapping providers
@@ -296,7 +280,7 @@ Point `--catalog` at a different YAML. No source changes; `tests/test_catalog.py
 asserts a wholesale swap works, including routing a request end-to-end through it.
 
 ```bash
-uv run --extra ml harness/run_routing.py --n 200 --arm all --catalog models.groq.yaml
+uv run --extra ml python -m harness.run_routing --n 200 --arm all --catalog models.groq.yaml
 ```
 
 ---

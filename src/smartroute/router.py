@@ -230,7 +230,7 @@ class Router:
         prompt_text: str,
         rid: str,
         t0: float,
-        params: dict | None = None,
+        params: dict,
     ) -> tuple[str, RoutingDecision]:
         """
         Two-layer dispatch: triage -> gate -> (cheap | middle | frontier | decompose).
@@ -268,30 +268,25 @@ class Router:
                 decision.gate_reason = f"{route.reason} | layer2: {result.reason}"
                 decision.escalated = result.route == "bailout-frontier"
             else:
-                content = await self._call_tier(route.path, messages, decision, params or {})
+                content = await self._call_tier(route.path, messages, decision, params)
+            await self._cache.put(prompt_text, content)
         except Exception as exc:
             decision.error = str(exc)
+            raise
+        finally:
             decision.latency_ms = (time.perf_counter() - t0) * 1000
             if self._log_path:
                 await _append_decision(self._log_path, decision)
-            raise
-
-        decision.latency_ms = (time.perf_counter() - t0) * 1000
-        await self._cache.put(prompt_text, content)
-        if self._log_path:
-            await _append_decision(self._log_path, decision)
         return content, decision
 
     async def _call_tier(
-        self, role: str, messages: list[dict], decision: RoutingDecision,
-        params: dict | None = None,
+        self, role: str, messages: list[dict], decision: RoutingDecision, params: dict
     ) -> str:
         """Single call to a named catalog tier."""
         spec = self._catalog.by_role(role)
         decision.cascade_path.append(spec.id)
         resp = await call_model(
-            spec.id, messages, timeout_s=settings.model_timeout_s, spec=spec,
-            **(params or {})
+            spec.id, messages, timeout_s=settings.model_timeout_s, spec=spec, **params
         )
         decision.final_model = spec.id
         decision.input_tokens += resp.input_tokens

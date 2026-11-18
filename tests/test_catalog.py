@@ -34,7 +34,6 @@ VALID = f"""
       - {{alias: frontier, id: {FRONTIER_ID}, role: frontier, env_key: TOGETHERAI_API_KEY}}
     routing:
       tiers: [cheap, middle, frontier]
-      default_tier: middle
 """
 
 
@@ -43,17 +42,12 @@ class TestPrice:
         price = Price(input_per_token=1e-6, output_per_token=2e-6)
         assert price.cost(1000, 500) == pytest.approx(1e-3 + 1e-3)
 
-    def test_per_mtok_helpers(self):
-        price = Price(input_per_token=5e-8, output_per_token=2e-7)
-        assert price.input_per_mtok == pytest.approx(0.05)
-        assert price.output_per_mtok == pytest.approx(0.20)
-
 
 class TestPriceResolution:
     def test_resolves_from_litellm_registry(self, tmp_path):
         catalog = load_catalog(write_catalog(tmp_path, VALID))
         # gpt-oss-20b is $0.05/M input in litellm's registry
-        assert catalog.resolve("cheap").price.input_per_mtok == pytest.approx(0.05)
+        assert catalog.resolve("cheap").price.input_per_token * 1e6 == pytest.approx(0.05)
 
     def test_yaml_price_overrides_registry(self, tmp_path):
         path = write_catalog(
@@ -65,12 +59,12 @@ class TestPriceResolution:
                 id: {CHEAP_ID}
                 role: cheap
                 price: {{input_per_mtok: 9.99, output_per_mtok: 1.11}}
-            routing: {{tiers: [cheap], default_tier: cheap}}
+            routing: {{tiers: [cheap]}}
             """,
         )
         price = load_catalog(path).resolve("cheap").price
-        assert price.input_per_mtok == pytest.approx(9.99)
-        assert price.output_per_mtok == pytest.approx(1.11)
+        assert price.input_per_token * 1e6 == pytest.approx(9.99)
+        assert price.output_per_token * 1e6 == pytest.approx(1.11)
 
     def test_unpriced_model_raises_rather_than_recording_zero(self, tmp_path):
         """The whole point: an unknown model must fail loudly, never cost $0.00."""
@@ -80,7 +74,7 @@ class TestPriceResolution:
             version: 1
             models:
               - {alias: ghost, id: nonexistent/not-a-real-model, role: cheap}
-            routing: {tiers: [ghost], default_tier: ghost}
+            routing: {tiers: [ghost]}
             """,
         )
         with pytest.raises(UnpricedModelError, match="no price in litellm's registry"):
@@ -93,7 +87,7 @@ class TestPriceResolution:
             version: 1
             models:
               - {{alias: cheap, id: {CHEAP_ID}, role: cheap, price: {{input_per_mtok: 1.0}}}}
-            routing: {{tiers: [cheap], default_tier: cheap}}
+            routing: {{tiers: [cheap]}}
             """,
         )
         with pytest.raises(CatalogError, match="input_per_mtok and output_per_mtok"):
@@ -110,7 +104,7 @@ class TestValidation:
             models:
               - {{alias: cheap,    id: {CHEAP_ID},    role: cheap}}
               - {{alias: frontier, id: {FRONTIER_ID}, role: frontier}}
-            routing: {{tiers: [frontier, cheap], default_tier: cheap}}
+            routing: {{tiers: [frontier, cheap]}}
             """,
         )
         with pytest.raises(CatalogError, match="ordered cheap -> expensive"):
@@ -124,7 +118,7 @@ class TestValidation:
             models:
               - {{alias: cheap, id: {CHEAP_ID}, role: cheap}}
               - {{alias: cheap, id: {MID_ID},   role: middle}}
-            routing: {{tiers: [cheap], default_tier: cheap}}
+            routing: {{tiers: [cheap]}}
             """,
         )
         with pytest.raises(CatalogError, match="duplicate alias"):
@@ -137,7 +131,7 @@ class TestValidation:
             version: 1
             models:
               - {{alias: cheap, id: {CHEAP_ID}, role: banana}}
-            routing: {{tiers: [cheap], default_tier: cheap}}
+            routing: {{tiers: [cheap]}}
             """,
         )
         with pytest.raises(CatalogError, match="role 'banana'"):
@@ -150,7 +144,7 @@ class TestValidation:
             version: 1
             models:
               - {{alias: cheap, id: {CHEAP_ID}, role: cheap}}
-            routing: {{tiers: [cheap, nope], default_tier: cheap}}
+            routing: {{tiers: [cheap, nope]}}
             """,
         )
         with pytest.raises(CatalogError, match="unknown alias 'nope'"):
@@ -183,12 +177,6 @@ class TestLookup:
         prices = [m.price.input_per_token for m in catalog.tiers]
         assert prices == sorted(prices)
 
-    def test_default_tier_is_middle_not_frontier(self, tmp_path):
-        """The architecture's core premise: the frontier is never a default."""
-        catalog = load_catalog(write_catalog(tmp_path, VALID))
-        assert catalog.default.alias == "middle"
-        assert catalog.default.role == "middle"
-
     def test_by_role_rejects_ambiguity(self, tmp_path):
         path = write_catalog(
             tmp_path,
@@ -197,16 +185,12 @@ class TestLookup:
             models:
               - {{alias: a, id: {CHEAP_ID}, role: cheap}}
               - {{alias: b, id: {MID_ID},   role: cheap}}
-            routing: {{tiers: [a, b], default_tier: a}}
+            routing: {{tiers: [a, b]}}
             """,
         )
         catalog = load_catalog(path)
         with pytest.raises(CatalogError, match="claim role 'cheap'"):
             catalog.by_role("cheap")
-
-    def test_contains(self, tmp_path):
-        catalog = load_catalog(write_catalog(tmp_path, VALID))
-        assert "cheap" in catalog and CHEAP_ID in catalog and "nope" not in catalog
 
 
 class TestPreflightAndProvenance:
@@ -217,7 +201,7 @@ class TestPreflightAndProvenance:
             version: 1
             models:
               - {{alias: cheap, id: {CHEAP_ID}, role: cheap, env_key: SOME_MISSING_KEY}}
-            routing: {{tiers: [cheap], default_tier: cheap}}
+            routing: {{tiers: [cheap]}}
             """,
         )
         monkeypatch.delenv("SOME_MISSING_KEY", raising=False)
@@ -230,7 +214,7 @@ class TestPreflightAndProvenance:
             version: 1
             models:
               - {{alias: cheap, id: {CHEAP_ID}, role: cheap, env_key: SOME_PRESENT_KEY}}
-            routing: {{tiers: [cheap], default_tier: cheap}}
+            routing: {{tiers: [cheap]}}
             """,
         )
         monkeypatch.setenv("SOME_PRESENT_KEY", "x")
@@ -253,7 +237,7 @@ class TestPreflightAndProvenance:
                   - {{alias: cheap,  id: {CHEAP_ID}, role: cheap}}
                   - {{alias: middle, id: {MID_ID},   role: middle,
                       price: {{input_per_mtok: 99.0, output_per_mtok: 99.0}}}}
-                routing: {{tiers: [cheap, middle], default_tier: middle}}
+                routing: {{tiers: [cheap, middle]}}
                 """,
             )
         )
@@ -266,7 +250,6 @@ class TestShippedCatalog:
     def test_repo_catalog_loads(self):
         catalog = load_catalog()
         assert [m.alias for m in catalog.tiers] == ["cheap", "middle", "frontier"]
-        assert catalog.default.alias == "middle"
 
     def test_repo_catalog_every_model_is_priced(self):
         for spec in load_catalog().all():
@@ -284,7 +267,7 @@ class TestAntiSelfGrading:
             models:
               - {{alias: cheap, id: {CHEAP_ID}, role: cheap}}
               - {{alias: judge, id: {MID_ID},   role: judge}}
-            routing: {{tiers: [cheap], default_tier: cheap}}
+            routing: {{tiers: [cheap]}}
             """,
         )
         # both are together_ai/openai/* -> same family
@@ -299,7 +282,7 @@ class TestAntiSelfGrading:
             models:
               - {{alias: cheap, id: {CHEAP_ID}, role: cheap}}
               - {{alias: judge, id: together_ai/mistralai/Mistral-Small-24B-Instruct-2501, role: judge}}
-            routing: {{tiers: [cheap], default_tier: cheap}}
+            routing: {{tiers: [cheap]}}
             """,
         )
         assert load_catalog(path).by_role("judge").alias == "judge"
@@ -325,13 +308,18 @@ class TestProviderSwapAcceptance:
     GROQ = """
         version: 1
         models:
-          - {alias: cheap,    id: groq/llama-3.1-8b-instant,    role: cheap,    env_key: GROQ_API_KEY}
-          - {alias: middle,   id: groq/qwen/qwen3-32b,          role: middle,   env_key: GROQ_API_KEY}
-          - {alias: frontier, id: groq/llama-3.3-70b-versatile, role: frontier, env_key: GROQ_API_KEY}
-          - {alias: judge,    id: groq/gemma-7b-it,             role: judge,    env_key: GROQ_API_KEY}
+          # Prices pinned: litellm's registry drifts (it dropped llama-3.1-8b-instant),
+          # and this test is about the swap, not about the registry.
+          - {alias: cheap,    id: groq/llama-3.1-8b-instant,    role: cheap,    env_key: GROQ_API_KEY,
+             price: {input_per_mtok: 0.05, output_per_mtok: 0.08}}
+          - {alias: middle,   id: groq/qwen/qwen3-32b,          role: middle,   env_key: GROQ_API_KEY,
+             price: {input_per_mtok: 0.29, output_per_mtok: 0.59}}
+          - {alias: frontier, id: groq/llama-3.3-70b-versatile, role: frontier, env_key: GROQ_API_KEY,
+             price: {input_per_mtok: 0.59, output_per_mtok: 0.79}}
+          - {alias: judge,    id: groq/gemma-7b-it,             role: judge,    env_key: GROQ_API_KEY,
+             price: {input_per_mtok: 0.07, output_per_mtok: 0.07}}
         routing:
           tiers: [cheap, middle, frontier]
-          default_tier: middle
     """
 
     def test_wholesale_provider_swap_loads(self, tmp_path):
@@ -341,7 +329,6 @@ class TestProviderSwapAcceptance:
             "groq/qwen/qwen3-32b",
             "groq/llama-3.3-70b-versatile",
         ]
-        assert catalog.default.alias == "middle"
         assert all(m.price.input_per_token > 0 for m in catalog.all())
 
     async def test_router_dispatches_through_a_swapped_catalog(self, tmp_path):
@@ -456,7 +443,7 @@ class TestUnsupportedParams:
                 id: {CHEAP_ID}
                 role: cheap
                 unsupported_params: [temperature]
-            routing: {{tiers: [cheap], default_tier: cheap}}
+            routing: {{tiers: [cheap]}}
             """,
         )
         spec = load_catalog(path).by_role("cheap")
@@ -481,7 +468,7 @@ class TestUnsupportedParams:
                 id: {CHEAP_ID}
                 role: cheap
                 unsupported_params: [temperature]
-            routing: {{tiers: [cheap], default_tier: cheap}}
+            routing: {{tiers: [cheap]}}
             """,
         )
         spec = load_catalog(path).by_role("cheap")
@@ -496,7 +483,7 @@ class TestUnsupportedParams:
             response.choices = [choice]
             return response
 
-        with patch("smartroute.providers.acompletion", side_effect=record):
+        with patch("litellm.acompletion", side_effect=record):
             await call_model(spec.id, [{"role": "user", "content": "hi"}],
                              spec=spec, temperature=0, max_tokens=64)
 
