@@ -2,18 +2,20 @@
 
 <p align="center">
   <b>An LLM router that sends each request to the cheapest model that can handle it, plus the harness that tells you whether routing is worth doing at all.</b><br>
-  <sub>On 200 everyday queries routing didn't pay · Python, LiteLLM, MiniLM · Apr to Sep 2026</sub>
+  <sub>On everyday queries routing didn't pay · on RouterBench, Jev-checked escalation hit 95% of GPT-4 accuracy at ~25% of its cost · Python, LiteLLM, MiniLM, Jev · Apr to Nov 2026</sub>
 </p>
 
 ### at a glance
 
 ```yaml
 what:    LLM inference router + benchmark harness
-result:  negative. always-cheap matched accuracy at about 1/4 the cost of routing
-stack:   [Python, LiteLLM, sentence-transformers, scikit-learn, FastAPI]
+result:  everyday traffic: negative. always-cheap matched accuracy at 1/4 the cost of routing
+         RouterBench (36k prompts): routing + Jev answer check reaches 95% of GPT-4
+         accuracy at 23-28% of GPT-4's cost; beats RouterBench's Zero-router baseline
+stack:   [Python, LiteLLM, sentence-transformers, scikit-learn, FastAPI, Jev decision model]
 default: Together AI catalog (models.yaml); Groq and Anthropic catalogs swappable
-built:   Apr to Sep 2026 · solo side project
-status:  router, harness, server, cache and observability built; 202 tests
+built:   Apr to Nov 2026 · solo side project
+status:  router, escalation checkers, harness, server, cache, observability; 261 tests
 ```
 
 The router is real and works. The harness is the reason this repo exists: run it against your own traffic before you believe anyone's cost-savings claim, including this one.
@@ -42,6 +44,33 @@ so there is nothing to escalate for.
 **Routing pays only when some traffic actually fails at the cheap tier.** If yours
 does, this harness will show you; if it doesn't, it will save you from shipping a 4×
 bill for nothing. [Full benchmark documentation →](BENCHMARK.md)
+
+### where routing does pay: RouterBench
+
+[RouterBench](https://huggingface.co/datasets/withmartian/routerbench) has 36,483
+prompts (MMLU, GSM8K, HellaSwag, MBPP, …) where cheaper models *do* fail. Replayed over
+it, the router on its own was no better than always using the middle model. The
+missing piece was **knowing when the middle model's answer is wrong.**
+
+So after the middle model answers, SmartRoute asks **Jev**, a decision model, one
+yes/no question — *is this answer correct?* — and escalates to the frontier model only
+when Jev doubts it. Each check costs about $0.00005.
+
+| ladder: Mixtral-8x7B → GPT-3.5 → GPT-4 | accuracy | $/query |
+|---|---|---|
+| always GPT-4 | 79.6% | $0.0080 |
+| router, no check | 68.0% | $0.0007 |
+| **router + Jev check** | **80.0%** | **$0.0032** |
+
+- **95% of GPT-4's accuracy at 23–28% of GPT-4's cost** across the two ladders tested,
+  against 58% for the best fixed choice of model.
+- **Beats RouterBench's Zero-router baseline** on both ladders, with 95% confidence
+  intervals that exclude zero (5 random splits).
+- **Jev spots wrong answers far better than the alternatives**: AUC 0.93, against 0.70 for a
+  learned classifier and 0.81 for multi-model agreement.
+
+Caveats: RouterBench's benchmarks are public and may be in Jev's training data, and its
+models are from 2023. [Method, intervals and caveats →](BENCHMARK.md#routerbench-results)
 
 ### quickstart
 
@@ -199,6 +228,8 @@ src/smartroute/
   catalog.py      models.yaml → ModelSpec, prices, validation guards
   decision.py     layer 1 triage, the gate, expected-cost rule
   decomposer.py   layer 2: split, route sub-tasks, synthesise, bail out
+  escalation.py   answer checkers: Jev, learned, self-consistency, ensemble
+  taskroute.py    task type + effort via Jev → benchmark-ranked model on OpenRouter
   router.py       orchestration, cache, decision logging
   providers.py    provider seam; catalog is the pricing authority
   server.py       OpenAI-compatible FastAPI app
@@ -212,9 +243,11 @@ harness/
   train_triage.py   fit the two heads, persist the calibration curve
   eval_routing.py   routing accuracy, offline, $0
   run_routing.py    live cost/accuracy across arms
+  routerbench.py    RouterBench replay: checkers, AIQ, cost-to-95%, CIs over splits
+  train_checker.py  fit the learned answer checker on graded answers
 ```
 
-202 tests, no network required.
+261 tests, no network required.
 
 ### status and honest limits
 
@@ -233,9 +266,12 @@ What you should know before trusting any of it:
 - **Layer 2 has never executed.** On a 5× cheap→frontier spread, decompose plus
   synthesis costs more than a single frontier call, so the dollar guard suppresses it
   every time. Decomposition needs a wide ladder to be viable.
-- **The cascade verifier is disabled.** The previous judge (Qwen2.5-72B, $1.20/M) cost
-  1.44× the frontier call it existed to avoid, at every output length. Replacing it
-  with free logprob signals is unstarted.
+- **The original cascade verifier is disabled.** Its judge (Qwen2.5-72B, $1.20/M) cost
+  1.44× the frontier call it existed to avoid. It is superseded by the escalation
+  checkers (`JEV_ESCALATION=true`), which on RouterBench cost ~$0.00005 per check.
+- **The Jev result is unproven on live traffic.** It was measured on public benchmarks
+  that may be in Jev's training data, with 2023 models. Calibrate the escalation
+  threshold on your own graded answers before trusting it.
 
 ### contributing
 

@@ -9,7 +9,7 @@ found.
 - [The arms](#the-arms) — what each one isolates
 - [Metrics](#metrics) — what every column means
 - [Results](#results) — what was measured, 2026-09-21
-- [RouterBench results](#routerbench-results) — 36k prompts, with and without answer checkers, 2026-11-18
+- [RouterBench results](#routerbench-results) — 36k prompts: where routing *does* pay, 2026-11-18
 - [Adding your own corpus](#adding-your-own-corpus)
 - [Methodology notes](#methodology-notes) — mistakes this harness has already made
 
@@ -257,154 +257,137 @@ Run the harness against your own traffic before believing any of it.
 
 ## RouterBench results
 
-**Run of 2026-11-18** — [RouterBench](https://huggingface.co/datasets/withmartian/routerbench)
-5-shot file (36,483 prompts after dropping 28 ARC-Challenge rows with no grades), replayed
-offline by `harness/routerbench.py`. Every number is on a random held-out 30%
-(10,956 prompts); the learned checker trains on the other 70%. No model was called:
-each tier maps to a RouterBench model and that model's *recorded* score and cost are
-read off, so this measures routing decisions, graded and priced with RouterBench's
-2023 models rather than this catalog's.
+> **TL;DR** — On 36,483 RouterBench prompts, the two-layer router alone is no better
+> than always using the middle model. Adding a **Jev answer check** (escalate to the
+> frontier model when Jev doubts the middle model's answer) reaches **95% of GPT-4's
+> accuracy at 23–28% of GPT-4's cost**, and beats RouterBench's Zero-router baseline on
+> both model ladders tested, with 95% confidence intervals that exclude zero.
 
-Two ladders:
+**Run of 2026-11-18.** [RouterBench](https://huggingface.co/datasets/withmartian/routerbench)
+5-shot file: 36,483 prompts across MMLU, HellaSwag, GSM8K, ARC, Winogrande, MBPP,
+MT-Bench and smaller sets (28 rows without grades dropped). Replayed offline by
+`harness/routerbench.py`: each routing tier maps to a RouterBench model, and that
+model's *recorded* grade and cost are read off. Only the Jev checks make live calls.
+
+**Protocol.** 5 random 70/30 splits. The learned checker trains on each 70%; every
+number is measured on the held-out 30% (~10,956 prompts) and averaged over the 5 splits.
+Brackets are 95% confidence intervals, corrected for overlapping test sets
+(Nadeau-Bengio). "Δ" columns are paired differences within each split.
 
 | ladder | cheap | middle | frontier |
 |---|---|---|---|
-| A | Mistral-7B | Mixtral-8x7B | GPT-4 |
-| B | Mixtral-8x7B | GPT-3.5 | GPT-4 |
+| **A** | Mistral-7B | Mixtral-8x7B | GPT-4 |
+| **B** | Mixtral-8x7B | GPT-3.5 | GPT-4 |
 
-The 5-shot file matches the paper's per-model scores (GPT-4 MMLU 82.5% vs 82.8%
-reported); the 0-shot file does not (Mistral-7B MMLU 25% — format failures), so earlier
-0-shot runs are superseded.
+### 1. The router alone is "always middle"
 
-### Without a checker, the router is "always middle"
+At the catalog's cost-of-a-wrong-answer setting, the router sends 98% of prompts to the
+middle tier and never chooses the frontier directly (split 1 shown):
 
-At the catalog's λ the decision router sends 98% of prompts (10,752 / 10,956) to the
-middle tier and never chooses the frontier directly:
-
-| arm | ladder A accuracy | A $/query | ladder B accuracy | B $/query |
+| | ladder A accuracy | $/query | ladder B accuracy | $/query |
 |---|---|---|---|---|
-| always-cheap | 49.5% | $0.000139 | 64.5% | $0.000415 |
-| always-middle | 64.5% | $0.000415 | 68.0% | $0.000710 |
-| always-frontier | 79.6% | $0.007970 | 79.6% | $0.007970 |
-| **routed, no checker** | **64.1%** | **$0.000412** | **68.0%** | **$0.000707** |
-| oracle (ladder) | 79.3% | $0.001081 | 81.9% | $0.001030 |
+| always cheap | 49.5% | $0.00014 | 64.5% | $0.00042 |
+| always middle | 64.5% | $0.00042 | 68.0% | $0.00071 |
+| always frontier | 79.6% | $0.00797 | 79.6% | $0.00797 |
+| **router, no checker** | **64.1%** | **$0.00041** | **68.0%** | **$0.00071** |
+| oracle: escalate exactly the wrong answers | 79.3% | $0.00108 | 81.9% | $0.00103 |
 
-The oracle — escalate exactly the prompts the middle tier gets wrong — matches
-always-frontier at ~1/8 of its cost. That gap is entirely "notice the middle answer is
-wrong", which is what the escalation checkers try to do.
+The oracle matches GPT-4 at about 1/8 of its cost. All of that gap is one problem:
+**noticing when the middle model's answer is wrong.** So the experiment is about the
+checker that decides when to escalate.
 
-### With a checker: middle → frontier escalation
+### 2. Checkers: how well each one spots a wrong answer
 
-Each checker scores the middle answer's P(correct); below a threshold the frontier
-answers instead. Checkers compared:
+AUC of each checker's P(correct) against the recorded grade (0.5 = coin flip, 1.0 = perfect):
 
-| checker | what it reads | marginal cost |
+| checker | how it works | extra cost / prompt | AUC, ladder A | AUC, ladder B |
+|---|---|---|---|---|
+| learned | classifier on MiniLM embeddings of prompt + answer | $0 | 0.700 [0.689, 0.712] | 0.707 [0.695, 0.720] |
+| agreement, cheap | does the cheap model give the same answer? | 1 cheap call | 0.633 [0.621, 0.645] | 0.694 [0.683, 0.705] |
+| agreement, peers | do 2 similar-priced models agree? | ~2 middle calls | 0.773 [0.766, 0.781] | 0.748 [0.740, 0.757] |
+| learned + peers | average of the two | ~2 middle calls | 0.814 [0.809, 0.819] | 0.804 [0.794, 0.815] |
+| **Jev** | decision model asked "is this answer correct?" | **~$0.000045** | **0.933 [0.927, 0.938]** | **0.938 [0.933, 0.944]** |
+
+Combining Jev with any other checker lowered its AUC (0.83–0.93), so Jev is used alone.
+
+### 3. Does it beat just picking a model?
+
+**AIQ** is RouterBench's metric: the average accuracy a router achieves across the whole
+cost range from always-cheap to always-frontier (higher is better). The bar is
+RouterBench's **Zero router** — the best fixed model, or mix of fixed models, at each
+price, with no per-prompt routing at all, chosen from all 11 models.
+
+| router | AIQ, A | Δ vs Zero router | AIQ, B | Δ vs Zero router |
+|---|---|---|---|---|
+| Zero router (bar to beat) | 0.750 | — | 0.757 | — |
+| router, no checker | 0.720 | −0.030 [−0.034, −0.026] | 0.741 | −0.015 [−0.020, −0.011] |
+| + learned + peers | 0.736 | −0.014 [−0.017, −0.011] | 0.752 | −0.004 [−0.008, −0.001] |
+| + agreement, cheap | 0.728 | −0.022 [−0.027, −0.016] | 0.756 | −0.000 [−0.006, +0.005] |
+| **+ Jev** | **0.772** | **+0.022 [+0.019, +0.026]** | **0.788** | **+0.032 [+0.028, +0.035]** |
+| + perfect checker (ceiling) | 0.794 | +0.044 | 0.808 | +0.051 |
+
+**Cost to reach 95% of GPT-4's accuracy**, as a share of always using GPT-4:
+
+| router | ladder A | ladder B |
 |---|---|---|
-| learned | MiniLM embeddings of (prompt, answer) → classifier | $0 (local) |
-| consistency[cheap] | agreement with the ladder's cheap model | one cheap call |
-| consistency[peers] | agreement with 2 similar-priced non-ladder models | ~two middle calls |
-| learned + consistency[peers] | mean of the two | ~two middle calls |
-| perfect | the recorded grade (ceiling, not achievable) | $0 |
+| router, no checker | 75% | 69% |
+| Zero router | 58% | 58% |
+| + learned + peers | 59% | 55% |
+| **+ Jev** | **27.5%** | **22.7%** |
+| + perfect checker | 26% | 23% |
 
-RouterBench records one answer per model, so same-model resampling (`SC_SOURCE=middle`,
-the production default) cannot be replayed; cross-model agreement is the proxy.
+One operating point from each ladder (Jev threshold 0.65 and 0.60; split 1):
 
-**How well each checker separates right from wrong middle answers** (test AUC, 0.5 = chance):
+| | accuracy | $/query | vs always-GPT-4 |
+|---|---|---|---|
+| always GPT-4 | 79.6% | $0.00797 | — |
+| ladder A + Jev | 79.2% | $0.00363 | −0.4pp at 46% of the cost |
+| ladder B + Jev | 80.0% | $0.00322 | +0.4pp at 40% of the cost |
 
-| checker | ladder A | ladder B |
-|---|---|---|
-| learned | 0.709 | 0.709 |
-| consistency[cheap] | 0.630 | 0.700 |
-| consistency[peers] | 0.770 | 0.750 |
-| **learned + consistency[peers]** | **0.813** | **0.807** |
+### What this shows
 
-**Compared with no checker** — accuracy and cost at the catalog λ, at the most accurate
-threshold costing at most half of always-frontier (chosen on the test split, so these
-rows flatter slightly):
+- **Routing logic was never the bottleneck; error detection was.** Without a checker
+  the router sits below the Zero router on both ladders. With a perfect checker it
+  clears it easily. Every improvement measured here came from the checker.
+- **Jev nearly closes the gap to a perfect checker** — 95% of GPT-4 accuracy at 27.5% vs
+  26% (A) and 22.7% vs 23% (B) of GPT-4's cost — because it is both accurate (AUC 0.93)
+  and cheap (~6–11% of a middle-model call).
+- **Cheaper signals do not get there.** Agreement between models is a real signal
+  (AUC up to 0.81 combined), but asking two more models on every prompt costs more than
+  the escalations it saves. The one previously reported "win" (ladder B, cheap-model
+  agreement, +0.001 on a single split) is a tie once intervals are computed.
+- **Consistent with the RouterBench paper**, whose learned routers match but do not
+  beat the Zero router and whose cascades only pay with a judge error rate near 10%.
 
-| ladder A | accuracy | Δ vs no checker | $/query | cost vs no checker |
-|---|---|---|---|---|
-| routed, no checker | 64.1% | — | $0.000412 | 1.0× |
-| + learned @0.65 | 71.1% | +7.0pp | $0.003262 | 7.9× |
-| + consistency[cheap] @0.05 | 73.6% | +9.5pp | $0.004468 | 10.8× |
-| + consistency[peers] @0.05 | 72.4% | +8.3pp | $0.003588 | 8.7× |
-| + learned + consistency[peers] @0.50 | 73.3% | +9.2pp | $0.003905 | 9.5× |
-| + perfect checker | 82.3% | +18.2pp | $0.003169 | 7.7× |
+### Caveats
 
-| ladder B | accuracy | Δ vs no checker | $/query | cost vs no checker |
-|---|---|---|---|---|
-| routed, no checker | 68.0% | — | $0.000707 | 1.0× |
-| + learned @0.70 | 74.1% | +6.1pp | $0.003474 | 4.9× |
-| + consistency[cheap] @0.05 | 76.2% | +8.2pp | $0.003956 | 5.6× |
-| + consistency[peers] @0.05 | 73.7% | +5.7pp | $0.003700 | 5.2× |
-| + learned + consistency[peers] @0.45 | 74.1% | +6.1pp | $0.003747 | 5.3× |
-| + perfect checker | 82.7% | +14.7pp | $0.002975 | 4.2× |
-
-Every checker buys accuracy, but at a fixed operating point that only says "spending
-more on GPT-4 helps". The threshold-free comparison is below.
-
-### AIQ: does a checker beat just picking a model?
-
-AIQ is RouterBench's metric: the mean height of a router's non-decreasing convex hull of
-(cost, accuracy) points across the ladder's cost range, swept over λ and checker
-threshold. The bar to clear is the paper's **Zero router** — the best mix of fixed
-models with no per-prompt routing. "Cost to 95%" is what a router must spend per query
-to reach 95% of always-frontier accuracy (75.6%), as a share of always-frontier's cost.
-
-| router | AIQ A | Δ vs no checker | cost to 95%, A | AIQ B | Δ vs no checker | cost to 95%, B |
-|---|---|---|---|---|---|---|
-| zero (3 ladder models) | 0.7152 | | 75% | 0.7352 | | 69% |
-| **zero (all 11 models)** — the bar | **0.7432** | | **59%** | **0.7495** | | **59%** |
-| decision, no checker | 0.7152 | — | 75% | 0.7352 | — | 69% |
-| + learned | 0.7256 | +0.0104 | 65% | 0.7465 | +0.0113 | 55% |
-| + consistency[cheap] | 0.7230 | +0.0078 | 67% | **0.7506** | **+0.0154** | **46%** |
-| + consistency[peers] | 0.7291 | +0.0139 | 62% | 0.7425 | +0.0073 | 60% |
-| + learned + consistency[peers] | 0.7307 | +0.0154 | 59% | 0.7468 | +0.0116 | 54% |
-| + perfect checker | 0.7892 | +0.0740 | 26% | 0.8019 | +0.0667 | 23% |
-
-What this says:
-
-- **Without a checker the router adds nothing.** Its AIQ equals the 3-model Zero router
-  exactly on both ladders: sweeping λ moves only a handful of lookups, so it never leaves
-  the ladder's own hull. It also sits below the 11-model Zero router — a fixed choice
-  from a wider menu beats it.
-- **Every checker improves on no checker, by +0.007 to +0.015 AIQ.** Better detection
-  does not translate proportionally: the best separator (learned + peers, AUC 0.81)
-  pays ~two middle calls on *every* middle-routed prompt, which eats most of its gain.
-- **Only one configuration reaches the bar:** ladder B with consistency[cheap] —
-  0.7506 vs 0.7495, and 95% of frontier accuracy at 46% of frontier cost vs the Zero
-  router's 59%. It works there because ladder B's cheap tier (Mixtral) is strong enough
-  that agreeing with it means something, and cheap enough to ask on every prompt. On
-  ladder A the same checker is the weakest (cheap tier Mistral-7B, AUC 0.63).
-  A +0.001 margin from one split with no confidence interval is a tie, not a win.
-- **The ceiling is far away.** A perfect checker clears the bar by +0.05 AIQ and reaches
-  95% of frontier at a quarter of its cost. Closing that gap is a checker-quality
-  problem, not a routing-logic problem.
-
-This matches the RouterBench paper's own finding: its learned routers (KNN, MLP)
-match but do not clearly beat the Zero router, and cascades only pay when the judge's
-error rate is around 10% or less.
-
-### Not yet measured
-
-- **Jev** as the checker (`--jev-verify N`) — needs an OpenRouter key. It is the one
-  checker that reads the answer against the question rather than inferring difficulty
-  or agreement.
-- **Same-model self-consistency** (`SC_SOURCE=middle`) — not replayable from RouterBench.
-- **This catalog's models.** All of the above uses RouterBench's 2023 ladder; a
-  checker trained on Mixtral's answers says nothing about gpt-oss-120b.
+- **Benchmark contamination.** MMLU, HellaSwag and GSM8K are public and very likely in
+  Jev's training data, so part of its 0.93 AUC may be memorised answers rather than
+  judgement. Expect it to be weaker on novel traffic; measure it on your own graded
+  answers before relying on these numbers.
+- **2023 models.** RouterBench's ladder is Mistral / Mixtral / GPT-3.5 / GPT-4, not this
+  repo's catalog. The results test the routing and escalation decisions, not the
+  shipped models.
+- **Same-model self-consistency** (`SC_SOURCE=middle`) cannot be replayed — RouterBench
+  records one answer per model — so only cross-model agreement was measured.
+- **Jev pricing.** Calls went to TypeSafe's API, which reports tokens but not cost; they
+  are priced at Jev 1.14's OpenRouter list price ($0.04198 per million input tokens).
+  The full run was 72,966 checks, about $3.25, with zero failures.
+- Example operating points use thresholds picked on the test split; AIQ and
+  cost-to-95% do not depend on a threshold.
 
 ### Reproduce
 
 ```bash
+export TYPESAFE_API_KEY=...        # or OPENROUTER_API_KEY; Jev scores are cached
 uv run --extra ml --with pandas harness/routerbench.py --data routerbench_5shot.pkl \
-  --out harness/results/rb5sc_mistral_ladder.json
+  --splits 5 --jev --out harness/results/rbci_mistral_ladder.json
 uv run --extra ml --with pandas harness/routerbench.py --data routerbench_5shot.pkl \
-  --cheap mistralai/mixtral-8x7b-chat --middle gpt-3.5-turbo-1106 --frontier gpt-4-1106-preview \
-  --out harness/results/rb5sc_gpt35_ladder.json
+  --splits 5 --jev --cheap mistralai/mixtral-8x7b-chat --middle gpt-3.5-turbo-1106 \
+  --frontier gpt-4-1106-preview --out harness/results/rbci_gpt35_ladder.json
 ```
 
-Seed 42, embeddings of each prompt's last 1,000 characters (5-shot prompts put the
+Seed 42. Embeddings use each prompt's last 1,000 characters (5-shot prompts put the
 question last; MiniLM reads 256 tokens from the start).
 
 ---
