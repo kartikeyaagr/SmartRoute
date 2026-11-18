@@ -9,6 +9,7 @@ found.
 - [The arms](#the-arms) — what each one isolates
 - [Metrics](#metrics) — what every column means
 - [Results](#results) — what was measured, 2026-09-21
+- [RouterBench results](#routerbench-results) — 36k prompts, with and without answer checkers, 2026-11-18
 - [Adding your own corpus](#adding-your-own-corpus)
 - [Methodology notes](#methodology-notes) — mistakes this harness has already made
 
@@ -254,6 +255,158 @@ cheap tier. Three ways that becomes true:
 
 Run the harness against your own traffic before believing any of it.
 
+## RouterBench results
+
+**Run of 2026-11-18** — [RouterBench](https://huggingface.co/datasets/withmartian/routerbench)
+5-shot file (36,483 prompts after dropping 28 ARC-Challenge rows with no grades), replayed
+offline by `harness/routerbench.py`. Every number is on a random held-out 30%
+(10,956 prompts); the learned checker trains on the other 70%. No model was called:
+each tier maps to a RouterBench model and that model's *recorded* score and cost are
+read off, so this measures routing decisions, graded and priced with RouterBench's
+2023 models rather than this catalog's.
+
+Two ladders:
+
+| ladder | cheap | middle | frontier |
+|---|---|---|---|
+| A | Mistral-7B | Mixtral-8x7B | GPT-4 |
+| B | Mixtral-8x7B | GPT-3.5 | GPT-4 |
+
+The 5-shot file matches the paper's per-model scores (GPT-4 MMLU 82.5% vs 82.8%
+reported); the 0-shot file does not (Mistral-7B MMLU 25% — format failures), so earlier
+0-shot runs are superseded.
+
+### Without a checker, the router is "always middle"
+
+At the catalog's λ the decision router sends 98% of prompts (10,752 / 10,956) to the
+middle tier and never chooses the frontier directly:
+
+| arm | ladder A accuracy | A $/query | ladder B accuracy | B $/query |
+|---|---|---|---|---|
+| always-cheap | 49.5% | $0.000139 | 64.5% | $0.000415 |
+| always-middle | 64.5% | $0.000415 | 68.0% | $0.000710 |
+| always-frontier | 79.6% | $0.007970 | 79.6% | $0.007970 |
+| **routed, no checker** | **64.1%** | **$0.000412** | **68.0%** | **$0.000707** |
+| oracle (ladder) | 79.3% | $0.001081 | 81.9% | $0.001030 |
+
+The oracle — escalate exactly the prompts the middle tier gets wrong — matches
+always-frontier at ~1/8 of its cost. That gap is entirely "notice the middle answer is
+wrong", which is what the escalation checkers try to do.
+
+### With a checker: middle → frontier escalation
+
+Each checker scores the middle answer's P(correct); below a threshold the frontier
+answers instead. Checkers compared:
+
+| checker | what it reads | marginal cost |
+|---|---|---|
+| learned | MiniLM embeddings of (prompt, answer) → classifier | $0 (local) |
+| consistency[cheap] | agreement with the ladder's cheap model | one cheap call |
+| consistency[peers] | agreement with 2 similar-priced non-ladder models | ~two middle calls |
+| learned + consistency[peers] | mean of the two | ~two middle calls |
+| perfect | the recorded grade (ceiling, not achievable) | $0 |
+
+RouterBench records one answer per model, so same-model resampling (`SC_SOURCE=middle`,
+the production default) cannot be replayed; cross-model agreement is the proxy.
+
+**How well each checker separates right from wrong middle answers** (test AUC, 0.5 = chance):
+
+| checker | ladder A | ladder B |
+|---|---|---|
+| learned | 0.709 | 0.709 |
+| consistency[cheap] | 0.630 | 0.700 |
+| consistency[peers] | 0.770 | 0.750 |
+| **learned + consistency[peers]** | **0.813** | **0.807** |
+
+**Compared with no checker** — accuracy and cost at the catalog λ, at the most accurate
+threshold costing at most half of always-frontier (chosen on the test split, so these
+rows flatter slightly):
+
+| ladder A | accuracy | Δ vs no checker | $/query | cost vs no checker |
+|---|---|---|---|---|
+| routed, no checker | 64.1% | — | $0.000412 | 1.0× |
+| + learned @0.65 | 71.1% | +7.0pp | $0.003262 | 7.9× |
+| + consistency[cheap] @0.05 | 73.6% | +9.5pp | $0.004468 | 10.8× |
+| + consistency[peers] @0.05 | 72.4% | +8.3pp | $0.003588 | 8.7× |
+| + learned + consistency[peers] @0.50 | 73.3% | +9.2pp | $0.003905 | 9.5× |
+| + perfect checker | 82.3% | +18.2pp | $0.003169 | 7.7× |
+
+| ladder B | accuracy | Δ vs no checker | $/query | cost vs no checker |
+|---|---|---|---|---|
+| routed, no checker | 68.0% | — | $0.000707 | 1.0× |
+| + learned @0.70 | 74.1% | +6.1pp | $0.003474 | 4.9× |
+| + consistency[cheap] @0.05 | 76.2% | +8.2pp | $0.003956 | 5.6× |
+| + consistency[peers] @0.05 | 73.7% | +5.7pp | $0.003700 | 5.2× |
+| + learned + consistency[peers] @0.45 | 74.1% | +6.1pp | $0.003747 | 5.3× |
+| + perfect checker | 82.7% | +14.7pp | $0.002975 | 4.2× |
+
+Every checker buys accuracy, but at a fixed operating point that only says "spending
+more on GPT-4 helps". The threshold-free comparison is below.
+
+### AIQ: does a checker beat just picking a model?
+
+AIQ is RouterBench's metric: the mean height of a router's non-decreasing convex hull of
+(cost, accuracy) points across the ladder's cost range, swept over λ and checker
+threshold. The bar to clear is the paper's **Zero router** — the best mix of fixed
+models with no per-prompt routing. "Cost to 95%" is what a router must spend per query
+to reach 95% of always-frontier accuracy (75.6%), as a share of always-frontier's cost.
+
+| router | AIQ A | Δ vs no checker | cost to 95%, A | AIQ B | Δ vs no checker | cost to 95%, B |
+|---|---|---|---|---|---|---|
+| zero (3 ladder models) | 0.7152 | | 75% | 0.7352 | | 69% |
+| **zero (all 11 models)** — the bar | **0.7432** | | **59%** | **0.7495** | | **59%** |
+| decision, no checker | 0.7152 | — | 75% | 0.7352 | — | 69% |
+| + learned | 0.7256 | +0.0104 | 65% | 0.7465 | +0.0113 | 55% |
+| + consistency[cheap] | 0.7230 | +0.0078 | 67% | **0.7506** | **+0.0154** | **46%** |
+| + consistency[peers] | 0.7291 | +0.0139 | 62% | 0.7425 | +0.0073 | 60% |
+| + learned + consistency[peers] | 0.7307 | +0.0154 | 59% | 0.7468 | +0.0116 | 54% |
+| + perfect checker | 0.7892 | +0.0740 | 26% | 0.8019 | +0.0667 | 23% |
+
+What this says:
+
+- **Without a checker the router adds nothing.** Its AIQ equals the 3-model Zero router
+  exactly on both ladders: sweeping λ moves only a handful of lookups, so it never leaves
+  the ladder's own hull. It also sits below the 11-model Zero router — a fixed choice
+  from a wider menu beats it.
+- **Every checker improves on no checker, by +0.007 to +0.015 AIQ.** Better detection
+  does not translate proportionally: the best separator (learned + peers, AUC 0.81)
+  pays ~two middle calls on *every* middle-routed prompt, which eats most of its gain.
+- **Only one configuration reaches the bar:** ladder B with consistency[cheap] —
+  0.7506 vs 0.7495, and 95% of frontier accuracy at 46% of frontier cost vs the Zero
+  router's 59%. It works there because ladder B's cheap tier (Mixtral) is strong enough
+  that agreeing with it means something, and cheap enough to ask on every prompt. On
+  ladder A the same checker is the weakest (cheap tier Mistral-7B, AUC 0.63).
+  A +0.001 margin from one split with no confidence interval is a tie, not a win.
+- **The ceiling is far away.** A perfect checker clears the bar by +0.05 AIQ and reaches
+  95% of frontier at a quarter of its cost. Closing that gap is a checker-quality
+  problem, not a routing-logic problem.
+
+This matches the RouterBench paper's own finding: its learned routers (KNN, MLP)
+match but do not clearly beat the Zero router, and cascades only pay when the judge's
+error rate is around 10% or less.
+
+### Not yet measured
+
+- **Jev** as the checker (`--jev-verify N`) — needs an OpenRouter key. It is the one
+  checker that reads the answer against the question rather than inferring difficulty
+  or agreement.
+- **Same-model self-consistency** (`SC_SOURCE=middle`) — not replayable from RouterBench.
+- **This catalog's models.** All of the above uses RouterBench's 2023 ladder; a
+  checker trained on Mixtral's answers says nothing about gpt-oss-120b.
+
+### Reproduce
+
+```bash
+uv run --extra ml --with pandas harness/routerbench.py --data routerbench_5shot.pkl \
+  --out harness/results/rb5sc_mistral_ladder.json
+uv run --extra ml --with pandas harness/routerbench.py --data routerbench_5shot.pkl \
+  --cheap mistralai/mixtral-8x7b-chat --middle gpt-3.5-turbo-1106 --frontier gpt-4-1106-preview \
+  --out harness/results/rb5sc_gpt35_ladder.json
+```
+
+Seed 42, embeddings of each prompt's last 1,000 characters (5-shot prompts put the
+question last; MiniLM reads 256 tokens from the start).
+
 ---
 
 ## Adding your own corpus
@@ -328,10 +481,23 @@ call, including layer 2's sub-tasks.
 intend to measure, and report routing accuracy on a held-out split. The trainer records
 `held_out_ids` in the model bundle for exactly this.
 
+**Check the dataset reproduces its paper before using it.** RouterBench's 0-shot file
+scores Mistral-7B at 25% on MMLU (random for four options) where the paper reports 56%;
+the 5-shot file matches. Two full runs on the 0-shot file had to be discarded.
+
+**Unwrap recorded answers before parsing them.** RouterBench stores answers as
+`str(list)` (`"['A\\n']"`), so letter extraction silently found nothing until the
+wrapper was stripped. Answers starting "A man walks…" were also read as choice A, and
+code was compared by its last number.
+
+**A checker's curve must include "checker off".** Without the un-escalated points, a
+checker that costs money on every prompt can score below the router it is attached to,
+which is not a real outcome — the operator can always switch it off.
+
 **Cost accounting must include failures.** An arm that errors more will look cheaper if
 errored prompts are dropped from the totals.
 
 ---
 
-*Last reviewed: 2026-09-22. Raw results in `harness/results/`; every figure above is
-reproducible from the JSONL there.*
+*Last reviewed: 2026-11-18. Raw results in `harness/results/` (gitignored); every
+figure above is reproducible from the commands shown.*
