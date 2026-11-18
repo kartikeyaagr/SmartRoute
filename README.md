@@ -15,7 +15,7 @@ result:  everyday traffic: negative. always-cheap matched accuracy at 1/4 the co
 stack:   [Python, LiteLLM, sentence-transformers, scikit-learn, FastAPI, Jev decision model]
 default: Together AI catalog (models.yaml); Groq and Anthropic catalogs swappable
 built:   Apr to Nov 2026 · solo side project
-status:  router, escalation checkers, harness, server, cache, observability; 261 tests
+status:  router, escalation checkers, harness, server, cache, observability; 246 tests
 ```
 
 The router is real and works. The harness is the reason this repo exists: run it against your own traffic before you believe anyone's cost-savings claim, including this one.
@@ -112,8 +112,8 @@ why, projected cost, sub-task count — so the response body stays 100% OpenAI-c
 Measure it on your own traffic:
 
 ```bash
-uv run --extra ml harness/eval_routing.py --compare          # routing accuracy, offline, $0
-uv run --extra ml harness/run_routing.py --n 200 --arm all   # live cost/accuracy, all arms
+uv run --extra ml python -m harness.eval_routing --compare          # routing accuracy, offline, $0
+uv run --extra ml python -m harness.run_routing --n 200 --arm all   # live cost/accuracy, all arms
 ```
 
 ### how routing works
@@ -204,7 +204,6 @@ models:
   - {alias: frontier, id: claude-opus-5,             role: frontier, env_key: ANTHROPIC_API_KEY}
 routing:
   tiers: [cheap, middle, frontier]
-  default_tier: middle
 decision:
   lambda_wrong_answer_usd: 0.01
 ```
@@ -247,7 +246,7 @@ harness/
   train_checker.py  fit the learned answer checker on graded answers
 ```
 
-261 tests, no network required.
+246 tests, no network required.
 
 ### status and honest limits
 
@@ -281,7 +280,7 @@ grader, and dataset membership supplies the routing labels.
 
 ```bash
 uv run pytest                    # must stay green
-uv run --extra ml harness/eval_routing.py --compare   # routing didn't regress
+uv run --extra ml python -m harness.eval_routing --compare   # routing didn't regress
 ```
 
 ### license

@@ -2,8 +2,8 @@
 """
 Does the classifier route each kind of request to the tier it belongs on?
 
-    uv run --extra ml harness/eval_routing.py
-    uv run --extra ml harness/eval_routing.py --lambda-wrong 0.0005 --triage heuristic
+    uv run --extra ml python -m harness.eval_routing
+    uv run --extra ml python -m harness.eval_routing --lambda-wrong 0.0005 --triage heuristic
 
 Costs nothing and calls no models: decide() is pure, so the whole corpus can be routed
 offline. Each question declares its own `expected_path`, so no hand-labelling is
@@ -18,36 +18,26 @@ much genuinely hard work gets dumped on the cheapest model.
 import argparse
 import collections
 import json
-import sys
 from pathlib import Path
-
-_REPO_ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(_REPO_ROOT))
-sys.path.insert(0, str(_REPO_ROOT / "src"))
 
 PATHS = ("cheap", "middle", "decompose", "frontier")
 
 
-def build_triage(kind: str):
-    from smartroute.decision import EmbeddingTriage, HeuristicTriage
-
-    return HeuristicTriage() if kind == "heuristic" else EmbeddingTriage()
-
-
-def evaluate(triage_kind: str, lambda_wrong: float, n: int | None, dataset_name: str = "synthetic") -> dict:
+def evaluate(triage_kind: str, lambda_wrong: float, n: int | None, corpus: Path | None = None) -> dict:
     """
     Route every question in the corpus and score it against its expected destination.
 
     Grouped by `expected_path` rather than by dataset: the synthetic corpus labels each
     item individually, so one corpus carries all three destinations.
     """
-    from harness.corpora import get_dataset
-    from smartroute.decision import DecisionLayer
+    from harness.corpora import SyntheticDataset
+    from smartroute.decision import DecisionLayer, EmbeddingTriage, HeuristicTriage
 
-    triage = build_triage(triage_kind)
+    triage = HeuristicTriage() if triage_kind == "heuristic" else EmbeddingTriage()
     layer = DecisionLayer(triage=triage, lambda_wrong_usd=lambda_wrong)
 
-    examples = get_dataset(dataset_name).load(n)
+    dataset = SyntheticDataset(corpus)
+    examples = dataset.load(n)
     by_expected: dict[str, list] = collections.defaultdict(list)
     for example in examples:
         by_expected[example.expected_path].append(example)
@@ -73,7 +63,7 @@ def evaluate(triage_kind: str, lambda_wrong: float, n: int | None, dataset_name:
 
     return {
         "triage": triage.backend(),
-        "dataset": dataset_name,
+        "dataset": str(dataset.path),
         "lambda_wrong_usd": lambda_wrong,
         "lookup_threshold": layer._lookup_threshold,
         "decompose_threshold": layer._decompose_threshold,
@@ -109,13 +99,13 @@ def main() -> None:
     ap.add_argument("--lambda-wrong", type=float, default=0.001,
                     help="operator's cost of a wrong answer, USD (default 0.001)")
     ap.add_argument("--n", type=int, default=None, help="rows to evaluate (default all)")
-    ap.add_argument("--dataset", type=str, default="synthetic")
+    ap.add_argument("--corpus", type=Path, default=None, help="corpus JSONL (default: the synthetic 200)")
     ap.add_argument("--compare", action="store_true", help="run both triage backends")
     ap.add_argument("--json", type=Path, help="also write results as JSON")
     args = ap.parse_args()
 
     kinds = ["heuristic", "embedding"] if args.compare else [args.triage]
-    results = [evaluate(k, args.lambda_wrong, args.n, args.dataset) for k in kinds]
+    results = [evaluate(k, args.lambda_wrong, args.n, args.corpus) for k in kinds]
     for result in results:
         render(result)
 

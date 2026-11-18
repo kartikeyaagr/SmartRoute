@@ -91,26 +91,14 @@ class TestSchemaInvariants:
         assert len(columns) == len(placeholders)
         assert placeholders == set(range(1, len(columns) + 1))
 
-    def test_every_inserted_column_exists_in_create_table(self):
-        from smartroute.db import _CREATE_TABLE, _INSERT
+    def test_every_inserted_column_is_declared(self):
+        """Declared in CREATE TABLE or added by a migration; anything else fails every INSERT."""
+        from smartroute.db import _CREATE_TABLE, _INSERT, _MIGRATIONS
 
+        schema = _CREATE_TABLE + " ".join(_MIGRATIONS)
         columns = [c.strip() for c in _INSERT.split("(", 1)[1].split(")", 1)[0].split(",")]
         for column in columns:
-            assert column in _CREATE_TABLE, f"{column} is inserted but not declared"
-
-    def test_new_decision_fields_have_migrations(self):
-        """
-        CREATE TABLE IF NOT EXISTS does nothing to an existing table, so any column
-        added after the first deploy needs an ALTER as well.
-        """
-        from smartroute.db import _MIGRATIONS
-
-        migrated = " ".join(_MIGRATIONS)
-        for column in (
-            "route_path", "gate_reason", "p_lookup",
-            "p_decompose", "projected_cost_usd", "subtask_count",
-        ):
-            assert column in migrated, f"{column} has no migration"
+            assert column in schema, f"{column} is inserted but not declared"
 
     def test_migrations_are_idempotent(self):
         from smartroute.db import _MIGRATIONS

@@ -42,7 +42,6 @@ class TestParsePlan:
     def test_subtasks_are_parsed_with_tiers(self):
         plan = parse_plan(plan_json(("find the director", "cheap"), ("compare them", "middle")))
         assert [s.tier for s in plan.subtasks] == ["cheap", "middle"]
-        assert plan.should_execute
 
     def test_json_embedded_in_prose_is_recovered(self):
         """Chat models wrap JSON in commentary; that should not cost a request."""
@@ -61,10 +60,6 @@ class TestParsePlan:
     def test_fan_out_is_capped(self):
         many = tuple((f"task {i}", "cheap") for i in range(20))
         assert len(parse_plan(plan_json(*many)).subtasks) == MAX_SUBTASKS
-
-    def test_single_subtask_is_not_worth_executing(self):
-        """One sub-task plus synthesis is strictly worse than answering directly."""
-        assert not parse_plan(plan_json(("only thing", "cheap"))).should_execute
 
 
 class TestGuards:
@@ -85,6 +80,15 @@ class TestGuards:
             result = await Decomposer().run("q", [{"role": "user", "content": "q"}])
         assert result.route == "direct-middle"
         assert "atomic" in result.reason
+
+    async def test_single_subtask_answers_directly(self):
+        """One sub-task plus synthesis is strictly worse than answering directly."""
+        with patch("smartroute.decomposer.call_model", side_effect=[
+            response(plan_json(("only thing", "cheap"))), response("direct answer"),
+        ]):
+            result = await Decomposer().run("q", [{"role": "user", "content": "q"}])
+        assert result.route == "direct-middle"
+        assert "single sub-task" in result.reason
 
     async def test_expensive_plan_bails_out_to_one_frontier_call(self):
         """

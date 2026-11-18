@@ -2,7 +2,7 @@
 """
 Fit the two layer-1 triage heads.
 
-    uv run --extra ml harness/train_triage.py
+    uv run --extra ml python -m harness.train_triage
 
 Why this exists
 ---------------
@@ -16,60 +16,39 @@ Both start "In what year"; only the second hides a second retrieval. No pattern 
 surface forms separates them, which is why the heads are learned over sentence
 embeddings instead.
 
-Labels are free — dataset membership *is* the routing label:
+Labels are free — each item's expected_path *is* the routing label:
 
-    TriviaQA  -> lookup=1, decompose=0
-    MMLU      -> lookup=0, decompose=0
-    HotpotQA  -> lookup=0, decompose=1
+    cheap     -> lookup=1, decompose=0
+    middle    -> lookup=0, decompose=0
+    decompose -> lookup=0, decompose=1
 
 The head is deliberately tiny (logistic regression on frozen embeddings). It has to
-run on every request for free, and there are only ~1500 training rows; anything with
-more capacity would memorise them.
+run on every request for free, and there are only a few hundred training rows; anything
+with more capacity would memorise them.
 """
 
 import argparse
 import json
-import sys
 from pathlib import Path
-
-# Running `python harness/train_triage.py` puts harness/ on sys.path, not the repo
-# root, so `import harness.corpora` would fail.
-_REPO_ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(_REPO_ROOT))
-sys.path.insert(0, str(_REPO_ROOT / "src"))
 
 MODEL_OUT = Path(__file__).resolve().parents[1] / "src" / "smartroute" / "data" / "triage.joblib"
 ENCODER = "all-MiniLM-L6-v2"
 
 
-def load_labelled(corpora: list[str]) -> tuple[list[str], list[int], list[int], list[str]]:
-    """
-    Training rows, labelled by each example's expected routing destination.
+def load_labelled(corpus: Path | None) -> tuple[list[str], list[int], list[int], list[str]]:
+    """Prompts, both head labels (from each item's expected_path), and source ids."""
+    from harness.corpora import SyntheticDataset
 
-    The academic corpora label a whole dataset at once; the synthetic corpus labels
-    per item, which is what lets one file carry all three classes.
-    """
-    from harness.corpora import get_dataset
-
-    prompts, lookup, decompose, source = [], [], [], []
-    for name in corpora:
-        dataset = get_dataset(name)
-        try:
-            examples = dataset.load()
-        except FileNotFoundError as exc:
-            raise SystemExit(f"{exc}\nGenerate the corpus first: uv run harness/data/synthetic_corpus.py")
-        for ex in examples:
-            prompts.append(ex.prompt)
-            lookup.append(int(ex.expected_path == "cheap"))
-            decompose.append(int(ex.expected_path == "decompose"))
-            source.append(name)
-    return prompts, lookup, decompose, source
-
-
-def _source_ids(corpora: list[str]) -> list[str]:
-    from harness.corpora import get_dataset
-
-    return [ex.source_id for name in corpora for ex in get_dataset(name).load()]
+    try:
+        examples = SyntheticDataset(corpus).load()
+    except FileNotFoundError as exc:
+        raise SystemExit(str(exc))
+    return (
+        [ex.prompt for ex in examples],
+        [int(ex.expected_path == "cheap") for ex in examples],
+        [int(ex.expected_path == "decompose") for ex in examples],
+        [ex.source_id for ex in examples],
+    )
 
 
 def _calibration_curve(head, x_test, y_test) -> list[dict]:
@@ -103,8 +82,7 @@ def main() -> None:
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--test-size", type=float, default=0.25)
     ap.add_argument("--out", type=Path, default=MODEL_OUT)
-    ap.add_argument("--corpora", type=str, default="synthetic",
-                    help="comma-separated corpora to train on (default: synthetic)")
+    ap.add_argument("--corpus", type=Path, default=None, help="corpus JSONL (default: the synthetic 200)")
     args = ap.parse_args()
 
     import joblib
@@ -113,10 +91,8 @@ def main() -> None:
     from sklearn.metrics import classification_report
     from sklearn.model_selection import train_test_split
 
-    corpora = args.corpora.split(",")
-    prompts, lookup, decompose, source = load_labelled(corpora)
-    ids = _source_ids(corpora)
-    print(f"{len(prompts)} labelled prompts from {corpora}")
+    prompts, lookup, decompose, ids = load_labelled(args.corpus)
+    print(f"{len(prompts)} labelled prompts")
     print(f"  lookup positives: {sum(lookup)}   decompose positives: {sum(decompose)}")
 
     print(f"encoding with {ENCODER}...")
@@ -162,7 +138,7 @@ def main() -> None:
         "calibration": calibration,
         "encoder": ENCODER,
         "held_out_ids": held_out_ids,
-        "trained_on": corpora,
+        "trained_on": str(args.corpus or "synthetic"),
     }, args.out)
     print(f"\nheld-out ids recorded: {len(held_out_ids)} of {len(prompts)}")
     print(f"\nwrote {args.out}")

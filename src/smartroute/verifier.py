@@ -11,14 +11,9 @@ refuses to load a judge that shares a family with the cheap or middle tier.
 import logging
 import re
 
+from smartroute.catalog import get_catalog
 from smartroute.config import settings
-
-from typing import TYPE_CHECKING
-
 from smartroute.providers import ProviderError, call_model
-
-if TYPE_CHECKING:
-    from smartroute.catalog import ModelSpec
 
 logger = logging.getLogger(__name__)
 
@@ -42,19 +37,6 @@ You are evaluating the quality of an LLM response. Reply with ONLY a single inte
 No other text. No explanation."""
 
 _INT_RE = re.compile(r"\b([1-5])\b")
-
-def _pick_verifier(cheap_model: str) -> "ModelSpec":
-    """
-    The judge for a given cheap model.
-
-    Cross-family separation is guaranteed at catalog load, so this is a plain lookup;
-    the old prefix-override map (`_VERIFIER_MODEL_FOR`) was always empty and its loop
-    never iterated.
-    """
-    from smartroute.catalog import get_catalog
-
-    return get_catalog().by_role("judge")
-
 
 def _parse_score(text: str) -> int | None:
     """Extract integer 1-5 from response text. Returns None if unparseable."""
@@ -85,7 +67,8 @@ class CascadeVerifier:
 
         Returns int 1-5. On parse failure after retry or timeout: returns 2 and logs WARNING.
         """
-        verifier_spec = _pick_verifier(cheap_model)
+        # Cross-family separation from cheap_model is enforced at catalog load.
+        verifier_spec = get_catalog().by_role("judge")
         verifier_model = verifier_spec.id
         messages = [
             {

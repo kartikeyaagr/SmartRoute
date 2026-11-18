@@ -33,7 +33,6 @@ models:
 
 routing:
   tiers: [cheap, middle, frontier]
-  default_tier: middle
 
 decision:
   # Anthropic's ladder is much more spread out than the Together one

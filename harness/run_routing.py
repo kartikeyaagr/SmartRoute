@@ -2,9 +2,9 @@
 """
 Run the mixed corpus through the router and measure what it actually cost.
 
-    uv run --extra ml harness/run_routing.py --n 200 --arm routed
-    uv run --extra ml harness/run_routing.py --n 200 --arm always-frontier
-    CATALOG_PATH=models.anthropic.yaml uv run --extra ml harness/run_routing.py --n 200
+    uv run --extra ml python -m harness.run_routing --n 200 --arm routed
+    uv run --extra ml python -m harness.run_routing --n 200 --arm always-frontier
+    uv run --extra ml python -m harness.run_routing --n 200 --catalog models.anthropic.yaml
 
 Arms
 ----
@@ -24,16 +24,13 @@ result rather than the batch.
 import argparse
 import asyncio
 import json
+import random
 import statistics
 import sys
 import time
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
-
-_REPO_ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(_REPO_ROOT))
-sys.path.insert(0, str(_REPO_ROOT / "src"))
 
 ARMS = ["routed", "always-cheap", "always-middle", "always-frontier"]
 RESULTS_DIR = Path(__file__).parent / "results"
@@ -83,7 +80,7 @@ async def _append(path: Path, result: PromptResult) -> None:
 
 
 async def run_one(example, dataset, arm, router, catalog, sem, out_path) -> PromptResult:
-    from smartroute.providers import ProviderError, call_model
+    from smartroute.providers import call_model
 
     result = PromptResult(
         source_id=example.source_id,
@@ -125,7 +122,7 @@ async def run_one(example, dataset, arm, router, catalog, sem, out_path) -> Prom
 
             result.response = content[:500]
             result.is_correct, result.extraction_failed = dataset.grade(example, content)
-        except (ProviderError, Exception) as exc:
+        except Exception as exc:
             result.error = f"{type(exc).__name__}: {exc}"[:300]
         result.latency_ms = (time.perf_counter() - t0) * 1000
 
@@ -160,7 +157,7 @@ def summarise(arm: str, results: list[PromptResult]) -> dict:
         "total_cost_usd": sum(r.cost_usd for r in results),
         "cost_per_prompt": sum(r.cost_usd for r in results) / max(len(results), 1),
         "p50_latency_ms": statistics.median(latencies),
-        "p95_latency_ms": sorted(latencies)[int(0.95 * len(latencies)) - 1] if len(latencies) > 1 else latencies[0],
+        "p95_latency_ms": statistics.quantiles(latencies, n=20)[-1] if len(latencies) > 1 else latencies[0],
         "total_tokens": sum(r.input_tokens + r.output_tokens for r in results),
         "by_dataset": by_dataset,
     }
@@ -227,9 +224,8 @@ def estimate(catalog, n: int, arms: list[str]) -> float:
 
 async def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--n", type=int, default=200, help="prompts total, split across the corpora in use")
-    ap.add_argument("--datasets", type=str, default=None,
-                    help="comma-separated corpora (default: the synthetic 200)")
+    ap.add_argument("--n", type=int, default=200, help="prompts to run")
+    ap.add_argument("--corpus", type=Path, default=None, help="corpus JSONL (default: the synthetic 200)")
     ap.add_argument("--arm", choices=ARMS + ["all"], default="routed")
     ap.add_argument("--catalog", type=str, default=None)
     ap.add_argument("--concurrency", type=int, default=8)
@@ -239,10 +235,10 @@ async def main() -> None:
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
 
-    from harness.corpora import mixed_stream
+    from harness.corpora import SyntheticDataset
     from smartroute.catalog import load_catalog, set_catalog
 
-    catalog = load_catalog(args.catalog) if args.catalog else load_catalog()
+    catalog = load_catalog(args.catalog)
     set_catalog(catalog)
 
     missing = catalog.missing_credentials()
@@ -250,17 +246,13 @@ async def main() -> None:
         sys.exit(f"missing credentials: {', '.join(missing)}")
 
     arms = ARMS if args.arm == "all" else [args.arm]
-    from harness.corpora import DEFAULT_DATASETS
-
-    names = args.datasets.split(",") if args.datasets else DEFAULT_DATASETS
-    # n is the total, so split it across however many corpora are in play.
-    per_dataset = max(1, args.n // len(names))
-    pairs = mixed_stream(per_dataset=per_dataset, seed=args.seed, names=names)
+    dataset = SyntheticDataset(args.corpus)
+    pairs = [(ex, dataset) for ex in dataset.load(args.n, seed=args.seed)]
+    random.Random(args.seed).shuffle(pairs)
 
     print(f"catalog: {[f'{m.alias}={m.id}' for m in catalog.tiers]}")
     print(f"fingerprint: {catalog.fingerprint()}")
-    print(f"corpora: {names}")
-    print(f"prompts: {len(pairs)} ({per_dataset} per corpus)   arms: {arms}")
+    print(f"prompts: {len(pairs)}   arms: {arms}")
 
     projected = estimate(catalog, len(pairs), arms)
     print(f"estimated cost: ${projected:.2f}  (ceiling ${args.cost_ceiling:.2f})")

@@ -194,7 +194,7 @@ class TestRouterTaskRank:
         router = Router(dispatch="taskrank", task_ranker=_ranker(fail_data=True))
         with patch("smartroute.router.call_model", new=AsyncMock(side_effect=lambda m, *a, **k: _resp(m))):
             _, d = await router.route_async([{"role": "user", "content": "x"}])
-        assert d.final_model == test_catalog.default.id
+        assert d.final_model == test_catalog.by_role("middle").id
         assert "taskrank unavailable" in d.gate_reason
 
     def test_invalid_dispatch_still_rejected(self):

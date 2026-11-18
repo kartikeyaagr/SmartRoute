@@ -30,6 +30,7 @@ from dataclasses import dataclass, field
 
 from smartroute.catalog import Catalog, ModelSpec, get_catalog
 from smartroute.config import settings
+from smartroute.decision import CostModel
 from smartroute.providers import ProviderError, call_model
 
 logger = logging.getLogger(__name__)
@@ -68,21 +69,12 @@ class SubTask:
     task: str
     tier: str
 
-    @property
-    def is_valid(self) -> bool:
-        return bool(self.task.strip()) and self.tier in VALID_TIERS
-
 
 @dataclass
 class Plan:
     atomic: bool
     subtasks: list[SubTask] = field(default_factory=list)
     malformed: bool = False
-
-    @property
-    def should_execute(self) -> bool:
-        """Splitting into one sub-task is just a more expensive direct answer."""
-        return not self.atomic and not self.malformed and len(self.subtasks) > 1
 
 
 @dataclass
@@ -120,12 +112,9 @@ def parse_plan(text: str) -> Plan:
     for item in raw.get("subtasks") or []:
         if not isinstance(item, dict):
             continue
-        candidate = SubTask(
-            task=str(item.get("task", "")),
-            tier=str(item.get("tier", "middle")).lower(),
-        )
-        if candidate.is_valid:
-            subtasks.append(candidate)
+        task, tier = str(item.get("task", "")), str(item.get("tier", "middle")).lower()
+        if task.strip() and tier in VALID_TIERS:
+            subtasks.append(SubTask(task, tier))
 
     if not subtasks:
         return Plan(atomic=False, malformed=True)
@@ -133,15 +122,9 @@ def parse_plan(text: str) -> Plan:
 
 
 class Decomposer:
-    def __init__(
-        self,
-        catalog: Catalog | None = None,
-        concurrency: int = 4,
-        max_subtasks: int = MAX_SUBTASKS,
-    ) -> None:
+    def __init__(self, catalog: Catalog | None = None) -> None:
         self._catalog = catalog or get_catalog()
-        self._concurrency = concurrency
-        self._max_subtasks = max_subtasks
+        self._costs = CostModel()
 
     # -- costing -----------------------------------------------------------
 
@@ -152,24 +135,25 @@ class Decomposer:
         Estimated from the plan rather than measured, because the point is to decide
         whether to run it at all.
         """
-        approx_in = len(prompt) // 4 + 60
-        approx_out = 200
+        c, prompt_tokens = self._costs, len(prompt) // 4
         subtask_cost = sum(
-            self._catalog.by_role(s.tier).cost(approx_in, approx_out) for s in plan.subtasks
+            self._catalog.by_role(s.tier).cost(prompt_tokens + c.subtask_in_tokens, c.subtask_out_tokens)
+            for s in plan.subtasks
         )
-        middle = self._catalog.by_role("middle")
-        synthesis = middle.cost(len(prompt) // 4 + len(plan.subtasks) * approx_out, 400)
+        synthesis = self._catalog.by_role("middle").cost(
+            prompt_tokens + len(plan.subtasks) * c.subtask_out_tokens, c.synthesis_out_tokens
+        )
         return subtask_cost + synthesis
 
     def _frontier_cost(self, prompt: str) -> float:
-        return self._catalog.by_role("frontier").cost(len(prompt) // 4, 300)
+        return self._catalog.by_role("frontier").cost(len(prompt) // 4, self._costs.answer_tokens)
 
     # -- execution ---------------------------------------------------------
 
     async def run(self, prompt: str, messages: list[dict]) -> DecompositionResult:
         result = DecompositionResult(content="", route="decomposed", reason="")
 
-        plan_text, plan_cost = await self._call("middle", [
+        plan_text = await self._call("middle", [
             {"role": "system", "content": _DECOMPOSE_SYSTEM},
             {"role": "user", "content": prompt},
         ], result)
@@ -179,11 +163,10 @@ class Decomposer:
             logger.warning("planner returned an unparseable plan — answering directly")
             return await self._direct(prompt, messages, result, "middle", "plan was malformed")
 
-        if not plan.should_execute:
+        # Splitting into one sub-task is just a more expensive direct answer.
+        if plan.atomic or len(plan.subtasks) < 2:
             reason = "planner judged the request atomic" if plan.atomic else "plan had a single sub-task"
             return await self._direct(prompt, messages, result, "middle", reason)
-
-        plan.subtasks = plan.subtasks[: self._max_subtasks]
 
         # Projected-cost bail-out. Decomposition exists to avoid a frontier call; if
         # the plan the model produced costs more than that call, the premise is gone.
@@ -204,7 +187,7 @@ class Decomposer:
         digest = "\n\n".join(
             f"SUB-TASK: {s.task}\nRESULT: {a}" for s, a in zip(plan.subtasks, answers)
         )
-        content, _ = await self._call("middle", [
+        content = await self._call("middle", [
             {"role": "system", "content": _SYNTHESIS_SYSTEM},
             {"role": "user", "content": f"ORIGINAL REQUEST:\n{prompt}\n\n{digest}"},
         ], result)
@@ -216,15 +199,14 @@ class Decomposer:
 
     async def _dispatch(self, plan: Plan, result: DecompositionResult) -> list[str]:
         """Sub-tasks are independent by construction, so they run concurrently."""
-        semaphore = asyncio.Semaphore(self._concurrency)
+        semaphore = asyncio.Semaphore(4)
 
         async def one(subtask: SubTask) -> str:
             async with semaphore:
                 try:
-                    text, _ = await self._call(
+                    return await self._call(
                         subtask.tier, [{"role": "user", "content": subtask.task}], result
                     )
-                    return text
                 except ProviderError as exc:
                     # One failed sub-task must not sink the whole request; synthesis
                     # is told what is missing and works with the rest.
@@ -241,7 +223,7 @@ class Decomposer:
         tier: str,
         reason: str,
     ) -> DecompositionResult:
-        content, _ = await self._call(tier, messages, result)
+        content = await self._call(tier, messages, result)
         result.content = content
         result.route = "direct-middle" if tier == "middle" else "bailout-frontier"
         result.reason = reason
@@ -249,7 +231,7 @@ class Decomposer:
 
     async def _call(
         self, tier: str, messages: list[dict], result: DecompositionResult
-    ) -> tuple[str, float]:
+    ) -> str:
         spec: ModelSpec = self._catalog.by_role(tier)
         response = await call_model(
             spec.id, messages, timeout_s=settings.model_timeout_s, spec=spec
@@ -258,4 +240,4 @@ class Decomposer:
         result.input_tokens += response.input_tokens
         result.output_tokens += response.output_tokens
         result.cost_usd += response.estimated_cost_usd
-        return response.content, response.estimated_cost_usd
+        return response.content

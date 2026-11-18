@@ -5,6 +5,5 @@ models:
   - {alias: frontier, id: groq/moonshotai/kimi-k2-instruct-0905,  role: frontier, env_key: GROQ_API_KEY}
 routing:
   tiers: [cheap, middle, frontier]
-  default_tier: middle
 decision:
   lambda_wrong_answer_usd: 0.001

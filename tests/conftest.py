@@ -30,7 +30,6 @@ _FIXTURE = f"""
       - {{alias: judge,    id: {JUDGE_ID},    role: judge,    env_key: TEST_KEY}}
     routing:
       tiers: [cheap, middle, frontier]
-      default_tier: middle
 """
 
 

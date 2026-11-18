@@ -52,8 +52,6 @@ models:
 routing:
   # Ordered cheap → expensive. Layer 2 picks a tier per sub-task from this list.
   tiers: [cheap, middle, frontier]
-  # The tier every non-lookup request falls back to. Deliberately not `frontier`.
-  default_tier: middle
 
 decision:
   # What a wrong answer costs you, in dollars. The single operator knob.
