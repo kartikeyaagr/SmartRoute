@@ -13,6 +13,7 @@
   <img src="https://img.shields.io/badge/tests-246%20passing-2ea44f" alt="246 tests passing" />
   <img src="https://img.shields.io/badge/API-OpenAI--compatible-4f46e5" alt="OpenAI-compatible API" />
   <img src="https://img.shields.io/badge/benchmark-RouterBench%2036k-656d76" alt="RouterBench, 36k prompts" />
+  <img src="https://img.shields.io/badge/license-GPLv3-656d76" alt="License: GPL v3" />
 </p>
 
 ## Results in brief
@@ -161,4 +162,4 @@ Known limits are documented in [BENCHMARK.md](BENCHMARK.md):
 
 ## License
 
-Not yet licensed. Contact kartikay3@outlook.com.
+[GNU GPL v3](LICENSE).
