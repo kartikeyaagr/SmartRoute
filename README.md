@@ -124,7 +124,7 @@ uv sync --extra server --extra ml --group dev && cp .env.example .env   # then a
 ```
 
 ```bash
-uv run pytest   # 246 tests, no network needed
+uv run pytest   # 268 tests, no network needed
 ```
 
 Use it as a library:
@@ -144,7 +144,23 @@ Or run it as a drop-in OpenAI-compatible server and change one `base_url`. The J
 JEV_ESCALATION=true uv run smartroute-server   # POST /v1/chat/completions on :8000
 ```
 
-Providers are a config change. The repo ships Together AI (`models.yaml`), Anthropic and Groq catalogs, and a test checks that swapping catalogs works end to end.
+Providers are a config change. The repo ships Together AI (`models.yaml`), Anthropic and Groq catalogs, and a test checks that swapping catalogs works end to end. To route across Claude Haiku, Sonnet and Opus 5.5, set `CATALOG_PATH=models.anthropic.yaml` and `ANTHROPIC_API_KEY` in `.env`.
+
+### Tracing
+
+Each request becomes one trace: a `smartroute.route` span with every model call nested inside it as a generation, carrying tokens and cost. Tracing is off until you configure a destination in `.env`.
+
+**Langfuse** (free tier): create a project at [cloud.langfuse.com](https://cloud.langfuse.com), open **Settings → API Keys**, and add the keys:
+
+```bash
+LANGFUSE_PUBLIC_KEY=pk-lf-...
+LANGFUSE_SECRET_KEY=sk-lf-...
+LANGFUSE_BASE_URL=https://cloud.langfuse.com   # US region: https://us.cloud.langfuse.com
+```
+
+**Any other OpenTelemetry backend** (Jaeger, Tempo, Honeycomb, an OTel Collector): set `OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318` instead. It takes precedence over the Langfuse keys.
+
+Prompts and answers stay out of traces unless you set `TRACE_CONTENT=true`. On Kubernetes, put the same variables in the `smartroute-keys` Secret, which the Helm chart loads.
 
 ## Where routing doesn't pay
 

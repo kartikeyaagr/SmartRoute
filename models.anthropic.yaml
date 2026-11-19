@@ -14,29 +14,30 @@ version: 1
 
 models:
   - alias: cheap
-    id: claude-haiku-4-5-20251001
+    id: claude-haiku-5-5
     role: cheap
     env_key: ANTHROPIC_API_KEY
+    # Claude 5.5 models 400 on non-default sampling params.
+    unsupported_params: [temperature, top_p]
 
   - alias: middle
-    id: claude-sonnet-5
+    id: claude-sonnet-5-5
     role: middle
     env_key: ANTHROPIC_API_KEY
-    # Measured: returns 400 `temperature is deprecated for this model`.
-    unsupported_params: [temperature]
+    unsupported_params: [temperature, top_p]
 
   - alias: frontier
-    id: claude-opus-5
+    id: claude-opus-5-5
     role: frontier
     env_key: ANTHROPIC_API_KEY
-    unsupported_params: [temperature]
+    unsupported_params: [temperature, top_p]
 
 routing:
   tiers: [cheap, middle, frontier]
 
 decision:
   # Anthropic's ladder is much more spread out than the Together one
-  # ($1 -> $2 -> $5 per M input, vs $0.05 -> $0.15 -> $0.60), so the saving from a
+  # ($0.10 -> $2 -> $4 per M input, vs $0.05 -> $0.15 -> $0.60), so the saving from a
   # correct lookup divert is larger and layer 1 can afford to fire more often at the
   # same lambda.
   lambda_wrong_answer_usd: 0.01
